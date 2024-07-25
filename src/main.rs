@@ -56,24 +56,9 @@ fn raw_data(msg: &AntMessage, out: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
         RxMessage::BroadcastData(msg2) => {
             out.extend(msg.header.pack()?);
             out.extend(msg2.payload.pack()?);
-            match msg2.extended_info {
-                Some(ext_info) => {
-                    out.extend(ext_info.flag_byte.pack()?);
-                    match ext_info.channel_id_output {
-                        Some(chan_id) => {
-                            out.extend(chan_id.pack()?);
-                        }
-                        None => {
-                            return Err("missing channel id".into())
-                        }
-                    }
-
-                }
-                None => {
-                    return Err("missing extended info".into())
-                }
-            }
-
+            let ext_info = msg2.extended_info.ok_or("missing extended info")?;
+            out.extend(ext_info.flag_byte.pack()?);
+            out.extend(ext_info.channel_id_output.ok_or("missing channel id")?.pack()?);
             out.push(msg.checksum);
             Ok(())
         }
