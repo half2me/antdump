@@ -1,0 +1,9 @@
+[package]
+name = "antdump"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ant = { git = "https://github.com/cujomalainey/ant-rs.git" }
+packed_struct = "0.10.1"
+rusb = "0.9.4"
