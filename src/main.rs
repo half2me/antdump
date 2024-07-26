@@ -78,7 +78,7 @@ fn main() -> std::io::Result<()> {
             Ok(Some(msg)) => match &msg.message {
                 RxMessage::BroadcastData(_) => {
                     let mut raw = vec![];
-                    raw_data(&msg, &mut raw).unwrap();
+                    to_slice(&msg, &mut raw).unwrap();
                     println!("{:02X?}", raw);
                     if let Some(stream) = &mut stream {
                         stream.write_all(raw.as_slice())?
@@ -92,7 +92,7 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-fn raw_data(msg: &AntMessage, out: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
+fn to_slice(msg: &AntMessage, out: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
     match msg.message {
         RxMessage::BroadcastData(msg2) => {
             out.extend(msg.header.pack()?);
