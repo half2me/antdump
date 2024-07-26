@@ -7,3 +7,4 @@ edition = "2021"
 ant = { git = "https://github.com/cujomalainey/ant-rs.git" }
 packed_struct = "0.10.1"
 rusb = "0.9.4"
+clap = { version = "4.5.11", features = ["derive"] }
