@@ -19,9 +19,14 @@ const RF_FREQ: u8 = 57;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Optional TCP server to stream raw ANT+ data to
-    #[arg(short, long)]
+    /// Address to a TCP server to connect to and send the data
+    #[arg(long)]
     server: Option<String>,
+
+    /// Optional hello message to send to the TCP server before sending ANT+ messages
+    /// a newline character will also be sent after the hello msg
+    #[arg(long)]
+    hello_msg: Option<String>,
 }
 
 fn main() -> std::io::Result<()> {
@@ -30,6 +35,14 @@ fn main() -> std::io::Result<()> {
         Some(url) => Some(TcpStream::connect(url)?),
         None => None,
     };
+
+    if let Some(stream) = &mut stream {
+        if let Some(hello) = &args.hello_msg {
+            stream
+                .write_all(format!("{}\n", hello).as_ref())
+                .expect("failed to send hello msg")
+        }
+    }
 
     let devices: Vec<Device<_>> = DeviceList::new()
         .expect("Unable to lookup usb devices")
@@ -85,7 +98,7 @@ fn main() -> std::io::Result<()> {
                     }
                 }
                 //_msg => println!("Got: {:#?}", _msg),
-                _msg => (),
+                _msg => println!("Got: {:#?}", _msg),
             },
             msg => panic!("Error: {:#?}", msg),
         }
