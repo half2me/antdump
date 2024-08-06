@@ -45,7 +45,7 @@ jobs:
             artifact_name: antdump
             asset_name: antdump-linux-x86_64
     runs-on: ${{ matrix.os }}
-    name: build and upload release
+    name: release
     steps:
       - uses: actions/checkout@v4
 

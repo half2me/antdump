@@ -50,8 +50,9 @@ fn main() -> std::io::Result<()> {
         .filter(|x| is_ant_usb_device_from_device(x))
         .collect();
 
-    let device = devices.into_iter().nth(0).unwrap();
-    let mut driver = UsbDriver::new(device).unwrap();
+    let device = devices.into_iter().nth(0).expect("No ANT+ dongle found");
+    //let handle = device.open().expect("could not open device");
+    let mut driver = UsbDriver::new(device).expect("Unable to initialize driver");
 
     // open RX Scan mode
     driver.send_message(&ResetSystem::new()).unwrap();
