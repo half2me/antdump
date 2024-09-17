@@ -10,7 +10,9 @@ use packed_struct::PackedStruct;
 use rusb::{Device, DeviceList};
 use std::error::Error;
 use std::io::Write;
+use std::io;
 use std::net::TcpStream;
+use std::{thread, time};
 
 const NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
 const RF_FREQ: u8 = 57;
@@ -29,20 +31,67 @@ struct Args {
     hello_msg: Option<String>,
 }
 
-fn main() -> std::io::Result<()> {
-    let args = Args::parse();
-    let mut stream = match args.server {
-        Some(url) => Some(TcpStream::connect(url)?),
-        None => None,
-    };
+pub struct DurableTCPStream {
+    addr: String,
+    hello: Option<String>,
+    stream: TcpStream,
+}
 
-    if let Some(stream) = &mut stream {
-        if let Some(hello) = &args.hello_msg {
-            stream
-                .write_all(format!("{}\n", hello).as_ref())
-                .expect("failed to send hello msg")
+impl DurableTCPStream {
+    fn establish_connection(addr: String, hello: Option<String>) -> TcpStream {
+        loop {
+            println!("connecting to server: {:?}", addr);
+            let mut stream = TcpStream::connect(addr.clone());
+            match stream {
+                Ok(mut stream) => {
+                    match hello {
+                        Some(ref hello) => {
+                            println!("sending hello:: {:?}", hello);
+                            let r = stream.write_all(format!("{}\n", hello).as_bytes());
+                            match r {
+                                Ok(_) => return stream,
+                                Err(why) => {
+                                    println!("Error connecting to server: {:?}", why);
+                                    thread::sleep(time::Duration::from_secs(3));
+                                    continue;
+                                }
+                            }
+                        }
+                        None => return stream
+                    }
+                }
+                Err(why) => {
+                    println!("Error connecting to server: {:?}", why);
+                    thread::sleep(time::Duration::from_secs(3));
+                    continue;
+                }
+            }
         }
     }
+
+    pub fn connect(addr: String, hello: Option<String>) -> Self {
+        let stream = Self::establish_connection(addr.clone(), hello.clone());
+        Self { hello, addr, stream }
+    }
+
+    pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        match self.stream.write_all(data) {
+            Ok(_) => Ok(()),
+            Err(why) => {
+                println!("Error writing to server: {:?}", why);
+                self.stream = DurableTCPStream::establish_connection(self.addr.clone(), self.hello.clone());
+                Err(why)
+            }
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    let args = Args::parse();
+    let mut stream = match args.server {
+        Some(url) => Some(DurableTCPStream::connect(url, args.hello_msg)),
+        None => None,
+    };
 
     let devices: Vec<Device<_>> = DeviceList::new()
         .expect("Unable to lookup usb devices")
@@ -51,7 +100,6 @@ fn main() -> std::io::Result<()> {
         .collect();
 
     let device = devices.into_iter().nth(0).expect("No ANT+ dongle found");
-    //let handle = device.open().expect("could not open device");
     let mut driver = UsbDriver::new(device).expect("Unable to initialize driver");
 
     // open RX Scan mode
@@ -95,10 +143,9 @@ fn main() -> std::io::Result<()> {
                     to_slice(&msg, &mut raw).unwrap();
                     println!("{:02X?}", raw);
                     if let Some(stream) = &mut stream {
-                        stream.write_all(raw.as_slice())?
+                        let _ = stream.write_all(raw.as_slice());
                     }
                 }
-                //_msg => println!("Got: {:#?}", _msg),
                 _msg => println!("Got: {:#?}", _msg),
             },
             msg => panic!("Error: {:#?}", msg),
