@@ -9,8 +9,8 @@ use clap::Parser;
 use packed_struct::PackedStruct;
 use rusb::{Device, DeviceList};
 use std::error::Error;
-use std::io::Write;
 use std::io;
+use std::io::Write;
 use std::net::TcpStream;
 use std::{thread, time};
 
@@ -43,23 +43,21 @@ impl DurableTCPStream {
             println!("connecting to server: {:?}", addr);
             let mut stream = TcpStream::connect(addr.clone());
             match stream {
-                Ok(mut stream) => {
-                    match hello {
-                        Some(ref hello) => {
-                            println!("sending hello:: {:?}", hello);
-                            let r = stream.write_all(format!("{}\n", hello).as_bytes());
-                            match r {
-                                Ok(_) => return stream,
-                                Err(why) => {
-                                    println!("Error connecting to server: {:?}", why);
-                                    thread::sleep(time::Duration::from_secs(3));
-                                    continue;
-                                }
+                Ok(mut stream) => match hello {
+                    Some(ref hello) => {
+                        println!("sending hello:: {:?}", hello);
+                        let r = stream.write_all(format!("{}\n", hello).as_bytes());
+                        match r {
+                            Ok(_) => return stream,
+                            Err(why) => {
+                                println!("Error connecting to server: {:?}", why);
+                                thread::sleep(time::Duration::from_secs(3));
+                                continue;
                             }
                         }
-                        None => return stream
                     }
-                }
+                    None => return stream,
+                },
                 Err(why) => {
                     println!("Error connecting to server: {:?}", why);
                     thread::sleep(time::Duration::from_secs(3));
@@ -71,7 +69,11 @@ impl DurableTCPStream {
 
     pub fn connect(addr: String, hello: Option<String>) -> Self {
         let stream = Self::establish_connection(addr.clone(), hello.clone());
-        Self { hello, addr, stream }
+        Self {
+            hello,
+            addr,
+            stream,
+        }
     }
 
     pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
@@ -79,7 +81,8 @@ impl DurableTCPStream {
             Ok(_) => Ok(()),
             Err(why) => {
                 println!("Error writing to server: {:?}", why);
-                self.stream = DurableTCPStream::establish_connection(self.addr.clone(), self.hello.clone());
+                self.stream =
+                    DurableTCPStream::establish_connection(self.addr.clone(), self.hello.clone());
                 Err(why)
             }
         }
