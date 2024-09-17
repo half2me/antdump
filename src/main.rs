@@ -11,8 +11,9 @@ use rusb::{Device, DeviceList};
 use std::error::Error;
 use std::io;
 use std::io::Write;
-use std::net::TcpStream;
-use std::{thread, time};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::thread;
+use std::time::Duration;
 
 const NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
 const RF_FREQ: u8 = 57;
@@ -41,26 +42,34 @@ impl DurableTCPStream {
     fn establish_connection(addr: String, hello: Option<String>) -> TcpStream {
         loop {
             println!("connecting to server: {:?}", addr);
-            let mut stream = TcpStream::connect(addr.clone());
+            let mut stream = TcpStream::connect_timeout(
+                &addr.to_socket_addrs().unwrap().next().unwrap(),
+                Duration::from_secs(10),
+            );
             match stream {
-                Ok(mut stream) => match hello {
-                    Some(ref hello) => {
-                        println!("sending hello:: {:?}", hello);
-                        let r = stream.write_all(format!("{}\n", hello).as_bytes());
-                        match r {
-                            Ok(_) => return stream,
-                            Err(why) => {
-                                println!("Error connecting to server: {:?}", why);
-                                thread::sleep(time::Duration::from_secs(3));
-                                continue;
+                Ok(mut stream) => {
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    match hello {
+                        Some(ref hello) => {
+                            println!("sending hello:: {:?}", hello);
+                            let r = stream.write_all(format!("{}\n", hello).as_bytes());
+                            match r {
+                                Ok(_) => return stream,
+                                Err(why) => {
+                                    println!("Error connecting to server: {:?}", why);
+                                    thread::sleep(Duration::from_secs(5));
+                                    continue;
+                                }
                             }
                         }
+                        None => return stream,
                     }
-                    None => return stream,
-                },
+                }
                 Err(why) => {
                     println!("Error connecting to server: {:?}", why);
-                    thread::sleep(time::Duration::from_secs(3));
+                    thread::sleep(Duration::from_secs(5));
                     continue;
                 }
             }
