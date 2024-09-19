@@ -12,6 +12,7 @@ use std::error::Error;
 use std::io;
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -36,6 +37,7 @@ pub struct DurableTCPStream {
     addr: String,
     hello: Option<String>,
     stream: TcpStream,
+    connected: Mutex<bool>,
 }
 
 impl DurableTCPStream {
@@ -82,16 +84,28 @@ impl DurableTCPStream {
             hello,
             addr,
             stream,
+            connected: Mutex::new(true),
         }
     }
 
     pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        if !*self.connected.lock().unwrap() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Reconnecting"));
+        }
         match self.stream.write_all(data) {
             Ok(_) => Ok(()),
             Err(why) => {
                 println!("Error writing to server: {:?}", why);
-                self.stream =
-                    DurableTCPStream::establish_connection(self.addr.clone(), self.hello.clone());
+                *self.connected.lock().unwrap() = false;
+
+                // reconnect
+                thread::spawn(move || {
+                    self.stream = DurableTCPStream::establish_connection(
+                        self.addr.clone(),
+                        self.hello.clone(),
+                    );
+                    *self.connected.lock().unwrap() = true
+                });
                 Err(why)
             }
         }
@@ -100,6 +114,7 @@ impl DurableTCPStream {
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
+
     let mut stream = match args.server {
         Some(url) => Some(DurableTCPStream::connect(url, args.hello_msg)),
         None => None,
@@ -150,12 +165,17 @@ fn main() -> io::Result<()> {
         match driver.get_message() {
             Ok(None) => (),
             Ok(Some(msg)) => match &msg.message {
-                RxMessage::BroadcastData(_) => {
+                RxMessage::BroadcastData(brd) => {
                     let mut raw = vec![];
                     to_slice(&msg, &mut raw).unwrap();
-                    println!("{:02X?}", raw);
+                    println!("[{}] {:02X?}", brd.payload.channel_number, brd.payload.data);
                     if let Some(stream) = &mut stream {
-                        let _ = stream.write_all(raw.as_slice());
+                        match stream.write_all(raw.as_slice()) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                println!("Msg skipped: {:?}", e);
+                            }
+                        }
                     }
                 }
                 _msg => println!("Got: {:#?}", _msg),
