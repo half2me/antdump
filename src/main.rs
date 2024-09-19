@@ -12,7 +12,7 @@ use std::error::Error;
 use std::io;
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -36,15 +36,15 @@ struct Args {
 pub struct DurableTCPStream {
     addr: String,
     hello: Option<String>,
-    stream: TcpStream,
-    connected: Mutex<bool>,
+    stream: Arc<Mutex<TcpStream>>,
+    connected: Arc<Mutex<bool>>,
 }
 
 impl DurableTCPStream {
     fn establish_connection(addr: String, hello: Option<String>) -> TcpStream {
         loop {
             println!("connecting to server: {:?}", addr);
-            let mut stream = TcpStream::connect_timeout(
+            let stream = TcpStream::connect_timeout(
                 &addr.to_socket_addrs().unwrap().next().unwrap(),
                 Duration::from_secs(10),
             );
@@ -83,8 +83,8 @@ impl DurableTCPStream {
         Self {
             hello,
             addr,
-            stream,
-            connected: Mutex::new(true),
+            stream: Arc::new(Mutex::new(stream)),
+            connected: Arc::new(Mutex::new(true)),
         }
     }
 
@@ -92,19 +92,23 @@ impl DurableTCPStream {
         if !*self.connected.lock().unwrap() {
             return Err(io::Error::new(io::ErrorKind::Other, "Reconnecting"));
         }
-        match self.stream.write_all(data) {
+        match self.stream.lock().unwrap().write_all(data) {
             Ok(_) => Ok(()),
             Err(why) => {
                 println!("Error writing to server: {:?}", why);
                 *self.connected.lock().unwrap() = false;
 
                 // reconnect
+                let stream = self.stream.clone();
+                let connected = self.connected.clone();
+                let addr = self.addr.clone();
+                let hello = self.hello.clone();
                 thread::spawn(move || {
-                    self.stream = DurableTCPStream::establish_connection(
-                        self.addr.clone(),
-                        self.hello.clone(),
+                    *stream.lock().unwrap() = DurableTCPStream::establish_connection(
+                        addr,
+                        hello,
                     );
-                    *self.connected.lock().unwrap() = true
+                    *connected.lock().unwrap() = true
                 });
                 Err(why)
             }
