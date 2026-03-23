@@ -90,7 +90,7 @@ impl DurableTCPStream {
 
     pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         if !*self.connected.lock().unwrap() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Reconnecting"));
+            return Err(io::Error::other("Reconnecting"));
         }
         match self.stream.lock().unwrap().write_all(data) {
             Ok(_) => Ok(()),
@@ -127,10 +127,10 @@ fn main() -> io::Result<()> {
     let devices: Vec<Device<_>> = DeviceList::new()
         .expect("Unable to lookup usb devices")
         .iter()
-        .filter(|x| is_ant_usb_device_from_device(x))
+        .filter(is_ant_usb_device_from_device)
         .collect();
 
-    let device = devices.into_iter().nth(0).expect("No ANT+ dongle found");
+    let device = devices.into_iter().next().expect("No ANT+ dongle found");
     let mut driver = UsbDriver::new(device).expect("Unable to initialize driver");
 
     // open RX Scan mode
