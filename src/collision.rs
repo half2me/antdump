@@ -78,14 +78,14 @@ mod tests {
 
     fn key_a() -> DeviceKey {
         DeviceKey {
-            device_number: 100,
+            device_number: 327780,
             device_type_id: 11,
         }
     }
 
     fn key_b() -> DeviceKey {
         DeviceKey {
-            device_number: 200,
+            device_number: 655560,
             device_type_id: 12,
         }
     }

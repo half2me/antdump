@@ -1,7 +1,3 @@
-mod collision;
-mod message;
-mod tcp;
-
 use ant::drivers::*;
 use ant::messages::RxMessage;
 use ant::messages::config::{
@@ -9,13 +5,12 @@ use ant::messages::config::{
     SetNetworkKey, TransmissionType,
 };
 use ant::messages::control::{OpenRxScanMode, ResetSystem};
+use antdump::collision::CollisionDetector;
+use antdump::message::{DeviceKey, serialize_broadcast};
+use antdump::tcp::TcpWriter;
 use clap::Parser;
 use std::io;
 use std::time::Duration;
-
-use collision::CollisionDetector;
-use message::{DeviceKey, serialize_broadcast};
-use tcp::TcpWriter;
 
 const NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
 const RF_FREQ: u8 = 57;

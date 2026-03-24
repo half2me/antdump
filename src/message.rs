@@ -8,15 +8,21 @@ use std::fmt;
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Default)]
 pub struct DeviceKey {
-    pub device_number: u16,
+    /// Full 20-bit device number (device_number | device_number_extension << 16)
+    pub device_number: u32,
     pub device_type_id: u8,
 }
 
 impl DeviceKey {
     pub fn from_broadcast(brd: &BroadcastData) -> Option<Self> {
         let chan_id = brd.extended_info?.channel_id_output?;
+        let ext = chan_id
+            .transmission_type
+            .device_number_extension
+            .to_primitive() as u32;
+        let full_device_number = chan_id.device_number as u32 | (ext << 16);
         Some(Self {
-            device_number: chan_id.device_number,
+            device_number: full_device_number,
             device_type_id: chan_id.device_type.device_type_id.to_primitive(),
         })
     }

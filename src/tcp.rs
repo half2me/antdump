@@ -7,6 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+pub trait StreamWrite: Send {
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()>;
+}
+
 pub struct DurableTcpStream {
     addr: String,
     hello: Option<String>,
@@ -55,8 +59,10 @@ impl DurableTcpStream {
             connected: Arc::new(Mutex::new(true)),
         }
     }
+}
 
-    pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+impl StreamWrite for DurableTcpStream {
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         if !*self.connected.lock().unwrap() {
             return Err(io::Error::other("Reconnecting"));
         }
@@ -111,7 +117,7 @@ impl WriteQueue {
     }
 }
 
-/// Non-blocking TCP writer with a leaky per-device buffer.
+/// Non-blocking writer with a leaky per-device buffer.
 /// Each device keeps only its latest serialized message; newer packets
 /// overwrite older unsent ones.
 pub struct TcpWriter {
@@ -121,6 +127,11 @@ pub struct TcpWriter {
 
 impl TcpWriter {
     pub fn spawn(addr: String, hello: Option<String>) -> Self {
+        let stream = DurableTcpStream::connect(addr, hello);
+        Self::spawn_with_stream(Box::new(stream))
+    }
+
+    pub fn spawn_with_stream(mut stream: Box<dyn StreamWrite>) -> Self {
         let buffers: Arc<Mutex<HashMap<DeviceKey, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
         let queue = Arc::new(Mutex::new(WriteQueue::new()));
 
@@ -130,7 +141,6 @@ impl TcpWriter {
         };
 
         thread::spawn(move || {
-            let mut stream = DurableTcpStream::connect(addr, hello);
             let mut local_keys = Vec::new();
             let mut send_buf = Vec::new();
 
