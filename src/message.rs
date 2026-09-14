@@ -1,7 +1,8 @@
 use ant::messages::AntMessage;
 use ant::messages::RxMessage;
-use ant::messages::data::BroadcastData;
+use ant::messages::data::{BroadcastData, RssiMeasurementValue};
 use packed_struct::PackedStruct;
+use packed_struct::PrimitiveEnum;
 use packed_struct::types::SizedInteger;
 use std::error::Error;
 use std::fmt;
@@ -28,12 +29,33 @@ impl DeviceKey {
     }
 }
 
+/// The dongle's own RX timestamp, in u16 ticks of its 32768 Hz clock.
+///
+/// Absent unless `LibConfig` enabled it, and on a clone that ignores LibConfig
+/// it stays absent for the life of the process. It measures when the RADIO
+/// heard the packet, which is the only timing the host cannot distort by
+/// batching several USB reads after a stall.
+pub fn rx_timestamp(msg: &AntMessage) -> Option<u16> {
+    match &msg.message {
+        RxMessage::BroadcastData(brd) => Some(brd.extended_info?.timestamp_output?.rx_timestamp),
+        _ => None,
+    }
+}
+
 impl fmt::Display for DeviceKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.device_number, self.device_type_id)
     }
 }
 
+/// Rebuild a broadcast's wire bytes for the TCP forward.
+///
+/// Every block the flag byte announces has to be written, in the order the
+/// dongle sent them (channel id, RSSI, timestamp) — the flag byte and the
+/// header's length are copied from the original, so a block that is announced
+/// and then missing leaves the reader parsing the checksum as payload. That is
+/// why RSSI and timestamps are here rather than only where they are consumed:
+/// `LibConfig` turning them on is what puts them in the header's length.
 pub fn serialize_broadcast(msg: &AntMessage, out: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
     match msg.message {
         RxMessage::BroadcastData(brd) => {
@@ -48,6 +70,19 @@ pub fn serialize_broadcast(msg: &AntMessage, out: &mut Vec<u8>) -> Result<(), Bo
                     .ok_or("missing channel id")?
                     .pack()?,
             );
+            if let Some(rssi) = ext_info.rssi_output {
+                // The measurement type leads, and it decides the block's LENGTH
+                // (dBm is 3 bytes, AGC 4) — which is also what shifts the
+                // timestamp block behind it.
+                out.push(rssi.measurement_type.to_primitive());
+                match rssi.measurement_value {
+                    RssiMeasurementValue::Dbm(v) => out.extend(v.pack()?),
+                    RssiMeasurementValue::Agc(v) => out.extend(v.pack()?),
+                }
+            }
+            if let Some(timestamp) = ext_info.timestamp_output {
+                out.extend(timestamp.pack()?);
+            }
             out.push(msg.checksum);
             Ok(())
         }

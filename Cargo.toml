@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ant = { git = "https://github.com/cujomalainey/ant-rs.git" }
+# Pinned by rev, and Cargo.lock is committed: this crate ships as fleet
+# firmware, so two builds of the same tag have to produce the same binary.
+# Unpinned, a push to ant-rs changes what a rebuild of an old tag contains.
+ant = { git = "https://github.com/cujomalainey/ant-rs.git", rev = "8728fa366524f5b39488bfc08e7f6337a57da064" }
 packed_struct = "0.10.1"
 rusb = "0.9.4"
 clap = { version = "4.6.0", features = ["derive"] }
