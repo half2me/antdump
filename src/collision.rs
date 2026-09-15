@@ -17,9 +17,12 @@ use std::time::{Duration, Instant};
 
 const RX_TICKS_PER_SECOND: f64 = 32768.0;
 
-/// Quarantine hold before release. Generous next to the 1 ms threshold, so a
-/// pair split by a host-side read stall still meets in quarantine.
-const HOLD: Duration = Duration::from_millis(50);
+/// Minimum quarantine hold before release. Generous next to the 1 ms default
+/// threshold, so a pair split by a host-side read stall still meets in
+/// quarantine. A threshold longer than this raises it (see `hold`), or a
+/// message could be released while a collision could still be declared against
+/// it, and only one of the pair would be dropped.
+const MIN_HOLD: Duration = Duration::from_millis(50);
 
 /// A u16 tick delta aliases every 2 s, so a small one is only trusted as "same
 /// window" when the wall clocks are close too.
@@ -36,16 +39,20 @@ pub struct CollisionDetector {
     /// None when the threshold outruns what the counter can express without
     /// aliasing, leaving the wall clock as the only usable source.
     threshold_ticks: Option<u16>,
+    hold: Duration,
     device_state: HashMap<DeviceKey, KeyState>,
     dropped: u64,
 }
 
 impl CollisionDetector {
     pub fn new(threshold: Duration) -> Self {
-        let ticks = (threshold.as_secs_f64() * RX_TICKS_PER_SECOND).round();
+        // Ceiling, not rounding: the comparison is `delta < limit` on an integer
+        // counter, so anything below it has to be inside the threshold.
+        let ticks = (threshold.as_secs_f64() * RX_TICKS_PER_SECOND).ceil();
         Self {
             threshold,
             threshold_ticks: (ticks < u16::MAX as f64).then_some(ticks as u16),
+            hold: threshold.max(MIN_HOLD),
             device_state: HashMap::new(),
             dropped: 0,
         }
@@ -96,16 +103,17 @@ impl CollisionDetector {
         survivor
     }
 
-    /// Release every quarantined message older than `HOLD`.
+    /// Release every quarantined message older than the hold.
     pub fn flush_expired(&mut self) -> Vec<(DeviceKey, AntMessage)> {
         self.flush_expired_at(Instant::now())
     }
 
     pub fn flush_expired_at(&mut self, now: Instant) -> Vec<(DeviceKey, AntMessage)> {
+        let hold = self.hold;
         self.device_state
             .iter_mut()
             .filter(|(_, state)| {
-                state.pending.is_some() && now.duration_since(state.last_wall) >= HOLD
+                state.pending.is_some() && now.duration_since(state.last_wall) >= hold
             })
             .map(|(key, state)| (*key, state.pending.take().unwrap()))
             .collect()
@@ -214,7 +222,7 @@ mod tests {
         det.feed_at(t0, key_a(), plain());
         det.feed_at(t0 + Duration::from_micros(100), key_b(), plain());
 
-        let flushed = det.flush_expired_at(t0 + HOLD + Duration::from_millis(1));
+        let flushed = det.flush_expired_at(t0 + MIN_HOLD + Duration::from_millis(1));
         assert_eq!(flushed.len(), 2);
         assert_eq!(det.dropped_count(), 0);
     }
@@ -232,7 +240,7 @@ mod tests {
                 .is_empty()
         );
 
-        let flushed = det.flush_expired_at(t0 + HOLD);
+        let flushed = det.flush_expired_at(t0 + MIN_HOLD);
         assert_eq!(flushed.len(), 1);
         assert_eq!(flushed[0].0, key_a());
         assert!(det.flush_expired_at(t0 + Duration::from_secs(1)).is_empty());
@@ -307,6 +315,32 @@ mod tests {
         // Beyond what a u16 at 32768 Hz can express.
         let det = CollisionDetector::new(Duration::from_secs(3));
         assert_eq!(det.threshold_ticks, None);
+    }
+
+    #[test]
+    fn threshold_ticks_round_up_so_the_integer_compare_stays_strict() {
+        // 1.01 ms is 33.095 ticks: a 33-tick gap is inside the threshold and
+        // must collide, which `33 < 33` would miss.
+        let det = CollisionDetector::new(Duration::from_micros(1_010));
+        assert_eq!(det.threshold_ticks, Some(34));
+    }
+
+    #[test]
+    fn a_threshold_longer_than_the_minimum_hold_raises_the_hold() {
+        let threshold = Duration::from_millis(100);
+        let mut det = CollisionDetector::new(threshold);
+        let t0 = Instant::now();
+
+        // Releasing at MIN_HOLD would hand out the first message, and the 75ms
+        // one would then collide with a peer that had already been delivered.
+        det.feed_at(t0, key_a(), plain());
+        assert!(det.flush_expired_at(t0 + MIN_HOLD).is_empty());
+        assert!(
+            det.feed_at(t0 + Duration::from_millis(75), key_a(), plain())
+                .is_none()
+        );
+        assert_eq!(det.dropped_count(), 2);
+        assert!(det.flush_expired_at(t0 + threshold).is_empty());
     }
 
     #[test]

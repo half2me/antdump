@@ -51,7 +51,14 @@ Docker build: `docker build -t antdump .`
 `EnableExtRxMessages` is the legacy switch and turns on the channel id block only; `LibConfig`
 supersedes it and is the only way to get RSSI and RX timestamps. Legacy first means a clone
 dongle that quietly ignores LibConfig still reports channel ids, while real firmware ends up
-with all three blocks because LibConfig lands last. LibConfig failing is logged, never fatal.
+with all three blocks because LibConfig lands last. Failure is logged, never fatal.
+
+**Whether the dongle ACCEPTED it is a separate message.** `send_message` returns once the
+bytes are on the bulk endpoint, so its `Ok` means "written", not "accepted" — the verdict
+comes back as a `ChannelResponse` carrying `TxMessageId::LibConfig`, which `await_response`
+drains for during init (the channel is not open yet, so nothing else is arriving). Without
+that read a rejection is invisible: the blocks simply never appear and collision timing
+silently falls back to the wall clock.
 
 Two consequences worth knowing:
 
