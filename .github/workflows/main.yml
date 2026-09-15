@@ -29,7 +29,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # --locked fails on a stale lock rather than silently updating it.
       - run: cargo build --locked
 
   test:
