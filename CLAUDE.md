@@ -72,7 +72,12 @@ there configured into the void.
 order lands — `flag=E0`, all three blocks, on every frame. Both answered LibConfig with
 `ResponseNoError` in 1.8 ms and 10.4 ms, so the 500 ms window is generous. Both report **AGC**
 RSSI (`0x10`, 4 bytes), so the dBm branch is still unexercised, and no clone was available, so
-the fallback path stays unobserved. RX timestamps are a real clock: per-device medians landed
+the fallback path stays unobserved.
+
+**There is no usable RSSI on this hardware.** Every stick tried reports AGC, and the register
+does not move: walking a sensor to the edge of range and out of it left it byte-identical, and
+then the packets stopped. So signal strength is not a thing this tool can report, and anything
+that wants a proximity or link-quality signal has to count packets over time instead. RX timestamps are a real clock: per-device medians landed
 on the ANT+ channel periods (8086 and 8182 ticks) to two decimals, every gap an integer
 multiple. Zero checksum or length mismatches across 307 frames, which is what confirms
 `serialize_broadcast` writes back every block the flag byte announces.
