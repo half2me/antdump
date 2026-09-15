@@ -29,10 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # --locked fails rather than silently updating Cargo.lock, which is the
-      # only thing that keeps the committed lock honest: without it a build
-      # resolves whatever is newest and the lock's reproducibility is a claim
-      # nobody checks.
+      # --locked fails on a stale lock rather than silently updating it.
       - run: cargo build --locked
 
   test:

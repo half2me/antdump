@@ -1,60 +1,40 @@
 //! Collision quarantine for promiscuous ANT+ capture.
 //!
-//! Some dongle firmware (notoriously clones) garbles two RF transmissions that
-//! overlap on the air into corrupt-but-well-formed packets: the USB checksum is
-//! computed over the already-corrupt bytes, so nothing downstream can spot them
-//! by content. A corrupt cumulative counter then produces a massive
-//! distance/speed jump. The one reliable signal is timing: real ANT+ sensors
-//! broadcast at ~4 Hz, so two messages from the same (device number, device
-//! type) within ~1 ms cannot both be genuine, and there is no way to tell which
-//! one is garbage, so BOTH are dropped. That loss is nearly free: the profiles
-//! are cumulative-counter based, so the next clean message's delta spans the gap.
-//!
-//! Mechanism: no message is delivered on arrival. It sits in per-key quarantine
-//! until either a same-key message lands inside the collision window (both die,
-//! and the window keeps sliding while garbage keeps coming) or the hold period
-//! passes and `flush_expired` releases it.
-//!
-//! Timing source: the dongle's RX timestamp (u16 ticks of its 32768 Hz clock,
-//! which is what `LibConfig` turns on) when present — it measures RF arrival and
-//! is immune to the host batching several USB reads after a stall, which makes
-//! wall-clock gaps collapse toward zero and false-collide legitimate messages.
-//! The u16 aliases every 2 s, so a wall-clock bound guards against a message
-//! landing exactly N×2 s later. Without RX timestamps (a clone that ignored
-//! LibConfig) wall-clock gaps are used.
+//! Some dongle firmware garbles two overlapping RF transmissions into
+//! corrupt-but-well-formed packets: the USB checksum covers the already-corrupt
+//! bytes, so only timing gives them away. ANT+ sensors broadcast at ~4 Hz, so two
+//! messages from one device inside the threshold cannot both be genuine, and
+//! nothing says which one is the garbage, so both are dropped. No message is
+//! delivered until it has survived quarantine.
 //!
 //! `raceble`'s `src/lib/devices/ant/collision.ts` is the same algorithm for the
-//! browser's WebUSB path, and the two are expected to agree packet for packet.
+//! browser's WebUSB path; the two are expected to agree packet for packet.
 
 use crate::message::{DeviceKey, rx_timestamp};
 use ant::messages::AntMessage;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// The dongle's RX timestamp counter runs at 32768 Hz and is 16 bits wide.
 const RX_TICKS_PER_SECOND: f64 = 32768.0;
 
 /// Quarantine hold before release. Generous next to the 1 ms threshold, so a
-/// pair split by a host-side read stall still meets in quarantine; invisible
-/// next to the 250 ms cadence a consumer sends telemetry on.
+/// pair split by a host-side read stall still meets in quarantine.
 const HOLD: Duration = Duration::from_millis(50);
 
-/// RX-timestamp gaps are only trusted as "same window" when the wall clocks are
-/// also plausibly close, since a u16 tick delta aliases every 2 s.
+/// A u16 tick delta aliases every 2 s, so a small one is only trusted as "same
+/// window" when the wall clocks are close too.
 const RX_TICK_ALIAS_GUARD: Duration = Duration::from_millis(1_500);
 
 struct KeyState {
     last_wall: Instant,
     last_rx_ticks: Option<u16>,
-    /// Message awaiting release; None right after a collision.
     pending: Option<AntMessage>,
 }
 
 pub struct CollisionDetector {
     threshold: Duration,
-    /// `threshold` in RX ticks, precomputed. None when the threshold is longer
-    /// than the counter can express without aliasing, which leaves the wall
-    /// clock as the only usable source.
+    /// None when the threshold outruns what the counter can express without
+    /// aliasing, leaving the wall clock as the only usable source.
     threshold_ticks: Option<u16>,
     device_state: HashMap<DeviceKey, KeyState>,
     dropped: u64,
@@ -75,19 +55,17 @@ impl CollisionDetector {
         self.threshold == Duration::ZERO
     }
 
-    /// Total messages discarded by collisions so far (diagnostics).
     pub fn dropped_count(&self) -> u64 {
         self.dropped
     }
 
-    /// Feed a message into the detector. Returns the previously quarantined
-    /// same-key message when the newcomer proves it survived its window; None
-    /// when the newcomer was quarantined or a collision killed both.
+    /// Returns the previously quarantined same-key message when the newcomer
+    /// proves it survived its window; None when the newcomer was quarantined or
+    /// a collision killed both.
     pub fn feed(&mut self, key: DeviceKey, msg: AntMessage) -> Option<AntMessage> {
         self.feed_at(Instant::now(), key, msg)
     }
 
-    /// Like `feed`, but with an explicit timestamp for testability.
     pub fn feed_at(&mut self, now: Instant, key: DeviceKey, msg: AntMessage) -> Option<AntMessage> {
         let ticks = rx_timestamp(&msg);
         let Some(entry) = self.device_state.get_mut(&key) else {
@@ -104,9 +82,6 @@ impl CollisionDetector {
 
         if is_collision(entry, now, ticks, self.threshold, self.threshold_ticks) {
             println!("WARNING: Collision on {key}, dropping messages");
-            // Ambiguous pair: drop the quarantined message AND the newcomer.
-            // The window slides, so a burst of garbled packets keeps
-            // suppressing until the key goes quiet.
             self.dropped += if entry.pending.is_some() { 2 } else { 1 };
             entry.pending = None;
             entry.last_wall = now;
@@ -121,12 +96,11 @@ impl CollisionDetector {
         survivor
     }
 
-    /// Release every quarantined message older than the hold period.
+    /// Release every quarantined message older than `HOLD`.
     pub fn flush_expired(&mut self) -> Vec<(DeviceKey, AntMessage)> {
         self.flush_expired_at(Instant::now())
     }
 
-    /// Like `flush_expired`, but with an explicit timestamp for testability.
     pub fn flush_expired_at(&mut self, now: Instant) -> Vec<(DeviceKey, AntMessage)> {
         self.device_state
             .iter_mut()
@@ -183,12 +157,11 @@ mod tests {
         }
     }
 
-    /// A message with no extended info at all — the clone-dongle case.
+    /// No extended info at all: the clone-dongle case.
     fn plain() -> AntMessage {
         AntMessage::default()
     }
 
-    /// A message carrying an RX timestamp, as a LibConfig-capable dongle sends.
     fn stamped(rx_timestamp: u16) -> AntMessage {
         let mut msg = AntMessage::default();
         let mut brd = BroadcastData::new(0, [0; 8]);
@@ -222,7 +195,7 @@ mod tests {
     fn collision_drops_both_messages() {
         let mut det = CollisionDetector::new(THRESHOLD);
         let t0 = Instant::now();
-        let t1 = t0 + Duration::from_micros(500); // inside the 1ms threshold
+        let t1 = t0 + Duration::from_micros(500);
 
         det.feed_at(t0, key_a(), plain());
         assert!(det.feed_at(t1, key_a(), plain()).is_none());
@@ -253,8 +226,7 @@ mod tests {
 
         det.feed_at(t0, key_a(), plain());
 
-        // Past the 1ms threshold but well inside the hold: a garbled twin
-        // delayed by a host-side read stall must still find its pair here.
+        // Past the threshold, well inside the hold.
         assert!(
             det.flush_expired_at(t0 + Duration::from_millis(5))
                 .is_empty()
@@ -272,8 +244,7 @@ mod tests {
         let t0 = Instant::now();
 
         det.feed_at(t0, key_a(), stamped(1_000));
-        // The host read the second message 20ms later (a stalled event loop
-        // batching USB reads), but the RADIO saw them 10 ticks apart.
+        // The host read them 20ms apart; the radio heard them 10 ticks apart.
         let result = det.feed_at(t0 + Duration::from_millis(20), key_a(), stamped(1_010));
         assert!(result.is_none());
         assert_eq!(det.dropped_count(), 2);
@@ -285,8 +256,7 @@ mod tests {
         let t0 = Instant::now();
 
         det.feed_at(t0, key_a(), stamped(1_000));
-        // Wall clock says 0ms apart, which the clock-only path would call a
-        // collision; the radio says a full 4 Hz period apart.
+        // Same wall-clock instant, 8192 ticks apart: a full 4 Hz period.
         let result = det.feed_at(t0, key_a(), stamped(1_000 + 8_192));
         assert!(result.is_some());
         assert_eq!(det.dropped_count(), 0);
@@ -298,8 +268,7 @@ mod tests {
         let t0 = Instant::now();
 
         det.feed_at(t0, key_a(), stamped(1_000));
-        // Exactly one counter wrap later (2 s), the tick delta is tiny again.
-        // Only the wall clock can tell that this is a different second.
+        // Exactly one counter wrap later, so the tick delta is tiny again.
         let result = det.feed_at(t0 + Duration::from_secs(2), key_a(), stamped(1_005));
         assert!(result.is_some());
         assert_eq!(det.dropped_count(), 0);
@@ -323,8 +292,7 @@ mod tests {
         let mut det = CollisionDetector::new(THRESHOLD);
         let t0 = Instant::now();
 
-        // One side missing ticks leaves the wall clock as the only shared
-        // source, rather than skipping the check.
+        // One side missing ticks leaves the wall clock as the only shared source.
         det.feed_at(t0, key_a(), plain());
         let result = det.feed_at(t0 + Duration::from_micros(200), key_a(), stamped(50));
         assert!(result.is_none());
@@ -336,8 +304,7 @@ mod tests {
         let det = CollisionDetector::new(THRESHOLD);
         assert_eq!(det.threshold_ticks, Some(THRESHOLD_TICKS));
 
-        // Beyond what a u16 at 32768 Hz can express, the tick path is off and
-        // the wall clock decides on its own.
+        // Beyond what a u16 at 32768 Hz can express.
         let det = CollisionDetector::new(Duration::from_secs(3));
         assert_eq!(det.threshold_ticks, None);
     }

@@ -70,23 +70,14 @@ fn init_driver() -> UsbDriver<rusb::GlobalContext> {
     driver
         .send_message(&ChannelRfFrequency::new(0, RF_FREQ))
         .unwrap();
-    // Two ways to ask for extended data, and the ORDER is the whole point.
-    // `EnableExtRxMessages` is the legacy switch and turns on the channel id
-    // block only; `LibConfig` supersedes it and is the only way to get RSSI
-    // and RX timestamps. Sending the legacy one first means a clone dongle
-    // that quietly ignores LibConfig still reports channel ids, while real
-    // firmware ends up with all three blocks because LibConfig lands last.
-    //
-    // RX timestamps are not a diagnostic luxury: the collision detector times
-    // by them, and wall-clock timing collapses to zero whenever the host
-    // batches several USB reads after a stall, which false-collides perfectly
-    // good messages.
+    // Order matters: `EnableExtRxMessages` is the legacy switch and turns on the
+    // channel id block only, `LibConfig` supersedes it and adds RSSI and RX
+    // timestamps. Legacy first leaves a clone that ignores LibConfig still
+    // reporting channel ids.
     driver
         .send_message(&EnableExtRxMessages::new(true))
         .unwrap();
     if let Err(err) = driver.send_message(&LibConfig::new(true, true, true)) {
-        // Never fatal. A dongle that rejects LibConfig outright still works on
-        // the legacy extension above, with coarser collision timing.
         eprintln!("WARNING: LibConfig rejected ({err:?}); no RSSI or RX timestamps");
     }
     driver
