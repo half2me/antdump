@@ -1,19 +1,24 @@
 use ant::drivers::*;
-use ant::messages::RxMessage;
+use ant::messages::channel::MessageCode;
 use ant::messages::config::{
     AssignChannel, ChannelId, ChannelRfFrequency, ChannelType, DeviceType, EnableExtRxMessages,
-    SetNetworkKey, TransmissionType,
+    LibConfig, SetNetworkKey, TransmissionType,
 };
 use ant::messages::control::{OpenRxScanMode, ResetSystem};
+use ant::messages::{RxMessage, TxMessageId};
 use antdump::collision::CollisionDetector;
 use antdump::message::{DeviceKey, serialize_broadcast};
 use antdump::tcp::TcpWriter;
 use clap::Parser;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
 const RF_FREQ: u8 = 57;
+
+/// How long to wait for the dongle's answer to `LibConfig`. A dongle that does
+/// not answer at all is the case this has to terminate on.
+const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Dump ANT+ data from the air
 #[derive(Parser, Debug)]
@@ -70,9 +75,31 @@ fn init_driver() -> UsbDriver<rusb::GlobalContext> {
     driver
         .send_message(&ChannelRfFrequency::new(0, RF_FREQ))
         .unwrap();
+    // Order matters: `EnableExtRxMessages` is the legacy switch and turns on the
+    // channel id block only, `LibConfig` supersedes it and adds RSSI and RX
+    // timestamps. Legacy first leaves a clone that ignores LibConfig still
+    // reporting channel ids.
     driver
         .send_message(&EnableExtRxMessages::new(true))
         .unwrap();
+    match driver.send_message(&LibConfig::new(true, true, true)) {
+        Err(err) => {
+            eprintln!("WARNING: LibConfig write failed ({err:?}); no RSSI or RX timestamps")
+        }
+        // `send_message` only writes to the endpoint, so whether the dongle
+        // ACCEPTED LibConfig is a separate message it sends back. Nothing else
+        // reads it, and a rejection is silent otherwise: the blocks simply never
+        // appear and the collision detector falls back to wall-clock timing.
+        Ok(()) => match await_response(&mut driver, TxMessageId::LibConfig) {
+            Some(MessageCode::ResponseNoError) => (),
+            Some(code) => {
+                eprintln!("WARNING: LibConfig rejected ({code:?}); no RSSI or RX timestamps")
+            }
+            None => {
+                eprintln!("WARNING: LibConfig unanswered; RSSI and RX timestamps may be absent")
+            }
+        },
+    }
     driver
         .send_message(&OpenRxScanMode {
             synchronous_channel_packets_only: None,
@@ -80,6 +107,25 @@ fn init_driver() -> UsbDriver<rusb::GlobalContext> {
         .unwrap();
 
     driver
+}
+
+/// Wait for the dongle's `ChannelResponse` to the message just sent, discarding
+/// responses to earlier ones. Safe to drain here because the channel is not open
+/// yet, so nothing is arriving but responses.
+fn await_response(
+    driver: &mut UsbDriver<rusb::GlobalContext>,
+    id: TxMessageId,
+) -> Option<MessageCode> {
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Ok(Some(msg)) = driver.get_message()
+            && let RxMessage::ChannelResponse(resp) = msg.message
+            && resp.message_id == id
+        {
+            return Some(resp.message_code);
+        }
+    }
+    None
 }
 
 fn main() -> io::Result<()> {
