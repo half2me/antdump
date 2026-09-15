@@ -1,24 +1,12 @@
 use ant::drivers::*;
-use ant::messages::channel::MessageCode;
-use ant::messages::config::{
-    AssignChannel, ChannelId, ChannelRfFrequency, ChannelType, DeviceType, EnableExtRxMessages,
-    LibConfig, SetNetworkKey, TransmissionType,
-};
-use ant::messages::control::{OpenRxScanMode, ResetSystem};
-use ant::messages::{RxMessage, TxMessageId};
+use ant::messages::RxMessage;
 use antdump::collision::CollisionDetector;
+use antdump::init::{InitError, LibConfigOutcome, configure};
 use antdump::message::{DeviceKey, serialize_broadcast};
 use antdump::tcp::TcpWriter;
 use clap::Parser;
 use std::io;
-use std::time::{Duration, Instant};
-
-const NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
-const RF_FREQ: u8 = 57;
-
-/// How long to wait for the dongle's answer to `LibConfig`. A dongle that does
-/// not answer at all is the case this has to terminate on.
-const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+use std::time::Duration;
 
 /// Dump ANT+ data from the air
 #[derive(Parser, Debug)]
@@ -43,89 +31,84 @@ struct Args {
     quiet: bool,
 }
 
-fn init_driver() -> UsbDriver<rusb::GlobalContext> {
-    let device = rusb::DeviceList::new()
-        .expect("Unable to lookup usb devices")
+/// How many times to bring the dongle up before giving up. A stale handle is
+/// cleared by a port reset and a fresh look at the bus, which is what the
+/// retry does; more than a couple of failures is a dongle that needs a human.
+const INIT_ATTEMPTS: u32 = 3;
+
+/// A port reset re-enumerates the device, so it is gone from the bus for a
+/// moment and has to be found again rather than reused.
+const REENUMERATE_DELAY: Duration = Duration::from_millis(500);
+
+fn find_dongle() -> Option<rusb::Device<rusb::GlobalContext>> {
+    rusb::DeviceList::new()
+        .ok()?
         .iter()
         .find(is_ant_usb_device_from_device)
-        .expect("No ANT+ dongle found");
-
-    let mut driver = UsbDriver::new(device).expect("Unable to initialize driver");
-
-    driver.send_message(&ResetSystem::new()).unwrap();
-    driver
-        .send_message(&SetNetworkKey::new(0, NETWORK_KEY))
-        .unwrap();
-    driver
-        .send_message(&AssignChannel::new(
-            0,
-            ChannelType::SharedReceiveOnly,
-            0,
-            None,
-        ))
-        .unwrap();
-    driver
-        .send_message(&ChannelId::new(
-            0,
-            0,
-            DeviceType::new(0.into(), false),
-            TransmissionType::new_wildcard(),
-        ))
-        .unwrap();
-    driver
-        .send_message(&ChannelRfFrequency::new(0, RF_FREQ))
-        .unwrap();
-    // Order matters: `EnableExtRxMessages` is the legacy switch and turns on the
-    // channel id block only, `LibConfig` supersedes it and adds RSSI and RX
-    // timestamps. Legacy first leaves a clone that ignores LibConfig still
-    // reporting channel ids.
-    driver
-        .send_message(&EnableExtRxMessages::new(true))
-        .unwrap();
-    match driver.send_message(&LibConfig::new(true, true, true)) {
-        Err(err) => {
-            eprintln!("WARNING: LibConfig write failed ({err:?}); no RSSI or RX timestamps")
-        }
-        // `send_message` only writes to the endpoint, so whether the dongle
-        // ACCEPTED LibConfig is a separate message it sends back. Nothing else
-        // reads it, and a rejection is silent otherwise: the blocks simply never
-        // appear and the collision detector falls back to wall-clock timing.
-        Ok(()) => match await_response(&mut driver, TxMessageId::LibConfig) {
-            Some(MessageCode::ResponseNoError) => (),
-            Some(code) => {
-                eprintln!("WARNING: LibConfig rejected ({code:?}); no RSSI or RX timestamps")
-            }
-            None => {
-                eprintln!("WARNING: LibConfig unanswered; RSSI and RX timestamps may be absent")
-            }
-        },
-    }
-    driver
-        .send_message(&OpenRxScanMode {
-            synchronous_channel_packets_only: None,
-        })
-        .unwrap();
-
-    driver
 }
 
-/// Wait for the dongle's `ChannelResponse` to the message just sent, discarding
-/// responses to earlier ones. Safe to drain here because the channel is not open
-/// yet, so nothing is arriving but responses.
-fn await_response(
-    driver: &mut UsbDriver<rusb::GlobalContext>,
-    id: TxMessageId,
-) -> Option<MessageCode> {
-    let deadline = Instant::now() + RESPONSE_TIMEOUT;
-    while Instant::now() < deadline {
-        if let Ok(Some(msg)) = driver.get_message()
-            && let RxMessage::ChannelResponse(resp) = msg.message
-            && resp.message_id == id
-        {
-            return Some(resp.message_code);
+/// Reset the dongle at the USB level and let it re-enumerate.
+///
+/// `UsbDriver::new` resets the handle it then claims the interface on, and a
+/// reset that re-enumerates invalidates that handle: libusb's own answer is to
+/// close it and rediscover the device, which nothing did. That is the state a
+/// restarted process inherited, where every write succeeded and no answer ever
+/// came back and only unplugging the stick cleared it.
+fn reset_dongle() {
+    if let Some(device) = find_dongle()
+        && let Ok(handle) = device.open()
+    {
+        let _ = handle.reset();
+    }
+    // The handle is dropped here, which is the half that was missing.
+    std::thread::sleep(REENUMERATE_DELAY);
+}
+
+fn open_dongle() -> Result<UsbDriver<rusb::GlobalContext>, InitError> {
+    let device = find_dongle().ok_or(InitError::Write {
+        message: "no ANT+ dongle found",
+    })?;
+    UsbDriver::new(device).map_err(|_| InitError::Write {
+        message: "the dongle could not be opened",
+    })
+}
+
+fn init_driver() -> UsbDriver<rusb::GlobalContext> {
+    for attempt in 1..=INIT_ATTEMPTS {
+        let mut driver = match open_dongle() {
+            Ok(driver) => driver,
+            Err(err) => {
+                eprintln!("ERROR: {err}");
+                reset_dongle();
+                continue;
+            }
+        };
+
+        match configure(&mut driver) {
+            Ok(outcome) => {
+                match outcome {
+                    LibConfigOutcome::Accepted => (),
+                    LibConfigOutcome::Rejected(code) => eprintln!(
+                        "WARNING: the dongle rejected LibConfig ({code:?}); no RSSI or RX timestamps, and collision detection falls back to wall-clock timing"
+                    ),
+                    LibConfigOutcome::Unanswered => eprintln!(
+                        "WARNING: the dongle did not answer LibConfig; no RSSI or RX timestamps, and collision detection falls back to wall-clock timing"
+                    ),
+                }
+                return driver;
+            }
+            Err(err) => {
+                eprintln!("ERROR: {err} (attempt {attempt} of {INIT_ATTEMPTS})");
+                drop(driver);
+                reset_dongle();
+            }
         }
     }
-    None
+
+    // Exiting is the honest outcome: a supervisor can restart us, and a restart
+    // now stands a chance because each attempt above reset the device properly.
+    eprintln!("FATAL: the dongle never answered. Unplug it and plug it back in.");
+    std::process::exit(1);
 }
 
 fn main() -> io::Result<()> {

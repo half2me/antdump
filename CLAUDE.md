@@ -53,12 +53,34 @@ supersedes it and is the only way to get RSSI and RX timestamps. Legacy first me
 dongle that quietly ignores LibConfig still reports channel ids, while real firmware ends up
 with all three blocks because LibConfig lands last. Failure is logged, never fatal.
 
-**Whether the dongle ACCEPTED it is a separate message.** `send_message` returns once the
-bytes are on the bulk endpoint, so its `Ok` means "written", not "accepted" — the verdict
-comes back as a `ChannelResponse` carrying `TxMessageId::LibConfig`, which `await_response`
-drains for during init (the channel is not open yet, so nothing else is arriving). Without
-that read a rejection is invisible: the blocks simply never appear and collision timing
-silently falls back to the wall clock.
+**Whether the dongle ACCEPTED anything is a separate message.** `send_message` returns once
+the bytes are on the bulk endpoint, so its `Ok` means "written", not "accepted". `src/init.rs`
+therefore confirms every message the channel depends on, and a reset is the probe: it always
+answers with a startup notification, so silence there means the dongle is not listening and
+nothing after it will change that. A refused `LibConfig` is the one degradation rather than a
+failure, since the legacy switch already carries channel ids.
+
+**A deaf dongle is the failure that matters, and a restart does not clear it.** Seen on a Pi:
+restart antdump and the stick stays silent until it is physically unplugged. `UsbDriver::new`
+resets the handle it then claims the interface on, and a reset that re-enumerates the device
+invalidates that handle — libusb's own answer is to close it and rediscover, which nothing
+did. So `init_driver` retries: reset at the USB level, drop the handle, wait out
+re-enumeration, look the device up again. Three attempts, then exit non-zero rather than sit
+there configured into the void.
+
+**Bench results (two genuine Dynastream sticks, 0fcf:1009 and 0fcf:1008, 307 frames):** the
+order lands — `flag=E0`, all three blocks, on every frame. Both answered LibConfig with
+`ResponseNoError` in 1.8 ms and 10.4 ms, so the 500 ms window is generous. Both report **AGC**
+RSSI (`0x10`, 4 bytes), so the dBm branch is still unexercised, and no clone was available, so
+the fallback path stays unobserved.
+
+**There is no usable RSSI on this hardware.** Every stick tried reports AGC, and the register
+does not move: walking a sensor to the edge of range and out of it left it byte-identical, and
+then the packets stopped. So signal strength is not a thing this tool can report, and anything
+that wants a proximity or link-quality signal has to count packets over time instead. RX timestamps are a real clock: per-device medians landed
+on the ANT+ channel periods (8086 and 8182 ticks) to two decimals, every gap an integer
+multiple. Zero checksum or length mismatches across 307 frames, which is what confirms
+`serialize_broadcast` writes back every block the flag byte announces.
 
 Two consequences worth knowing:
 
