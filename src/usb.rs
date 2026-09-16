@@ -15,7 +15,7 @@
 //! while `antdump` itself gives up after a few attempts and exits.
 
 use crate::init::{InitError, LibConfigOutcome, configure};
-use ant::drivers::{UsbDriver, is_ant_usb_device_from_device};
+use ant::drivers::{UsbDriver, UsbError, is_ant_usb_device_from_device};
 use rusb::{Device, GlobalContext};
 use std::fmt;
 use std::time::Duration;
@@ -43,6 +43,8 @@ pub enum BringUpError {
     NoDongle,
     /// libusb could not list the bus at all.
     Enumerate(rusb::Error),
+    /// A dongle was found and could not be opened or claimed.
+    Open(UsbError),
     /// A dongle was found and every attempt failed; this is the last failure.
     Init(InitError),
 }
@@ -52,6 +54,7 @@ impl fmt::Display for BringUpError {
         match self {
             Self::NoDongle => write!(f, "no ANT+ dongle found"),
             Self::Enumerate(err) => write!(f, "listing USB devices failed: {err}"),
+            Self::Open(err) => write!(f, "the dongle could not be opened: {err:?}"),
             Self::Init(err) => write!(f, "{err}"),
         }
     }
@@ -92,11 +95,16 @@ pub fn open_dongle() -> Result<Dongle, BringUpError> {
         Ok(None) => return Err(BringUpError::NoDongle),
         Err(err) => return Err(BringUpError::Enumerate(err)),
     };
-    UsbDriver::new(device).map_err(|_| {
-        BringUpError::Init(InitError::Write {
-            message: "the dongle could not be opened",
-        })
-    })
+    UsbDriver::new(device).map_err(classify_open)
+}
+
+/// libusb can still list a stick that has just been pulled (seen on macOS),
+/// so an open that finds no device is a missing dongle, not a broken one.
+fn classify_open(err: UsbError) -> BringUpError {
+    match err {
+        UsbError::FailedToOpenDevice(rusb::Error::NoDevice) => BringUpError::NoDongle,
+        err => BringUpError::Open(err),
+    }
 }
 
 /// The three operations the retry loop is made of, so the loop itself can be
@@ -127,18 +135,21 @@ impl BringUpOps for UsbOps {
 }
 
 /// Bring the dongle up as a promiscuous ANT+ receiver, resetting and
-/// re-finding it between attempts.
-///
-/// Each failed attempt is reported on stderr as it happens, and the error
-/// returned is the last one. `attempts` of zero is treated as one.
-pub fn bring_up(attempts: u32) -> Result<BringUp, BringUpError> {
-    bring_up_with(attempts, &mut UsbOps).map(|(driver, lib_config)| BringUp { driver, lib_config })
+/// re-finding it between attempts. Each failed attempt goes to `report` with
+/// its one-based number; the error returned is the last one.
+pub fn bring_up(
+    attempts: u32,
+    report: impl FnMut(u32, &BringUpError),
+) -> Result<BringUp, BringUpError> {
+    bring_up_with(attempts, &mut UsbOps, report)
+        .map(|(driver, lib_config)| BringUp { driver, lib_config })
 }
 
 /// [`bring_up`] over any set of operations.
 pub fn bring_up_with<O: BringUpOps>(
     attempts: u32,
     ops: &mut O,
+    mut report: impl FnMut(u32, &BringUpError),
 ) -> Result<(O::Driver, LibConfigOutcome), BringUpError> {
     let attempts = attempts.max(1);
     let mut last = BringUpError::NoDongle;
@@ -146,7 +157,7 @@ pub fn bring_up_with<O: BringUpOps>(
         let mut driver = match ops.open() {
             Ok(driver) => driver,
             Err(err) => {
-                eprintln!("ERROR: {err} (attempt {attempt} of {attempts})");
+                report(attempt, &err);
                 last = err;
                 ops.reset();
                 continue;
@@ -156,8 +167,9 @@ pub fn bring_up_with<O: BringUpOps>(
         match ops.configure(&mut driver) {
             Ok(lib_config) => return Ok((driver, lib_config)),
             Err(err) => {
-                eprintln!("ERROR: {err} (attempt {attempt} of {attempts})");
-                last = BringUpError::Init(err);
+                let err = BringUpError::Init(err);
+                report(attempt, &err);
+                last = err;
                 // The handle goes before the reset: a reset that re-enumerates
                 // invalidates it, and holding it is what left the stick deaf.
                 drop(driver);
@@ -225,10 +237,12 @@ mod tests {
         InitError::Deaf { message: "a reset" }
     }
 
+    fn unreported(_: u32, _: &BringUpError) {}
+
     #[test]
     fn a_healthy_dongle_comes_up_on_the_first_attempt_without_a_reset() {
         let mut ops = FakeOps::new(vec![Ok(())], vec![Ok(LibConfigOutcome::Unanswered)]);
-        let ((), outcome) = bring_up_with(3, &mut ops).unwrap();
+        let ((), outcome) = bring_up_with(3, &mut ops, unreported).unwrap();
         assert_eq!(outcome, LibConfigOutcome::Unanswered);
         assert_eq!(ops.steps, [Step::Open, Step::Configure]);
     }
@@ -239,7 +253,7 @@ mod tests {
             vec![Ok(()), Ok(())],
             vec![Err(deaf()), Ok(LibConfigOutcome::Accepted)],
         );
-        assert!(bring_up_with(3, &mut ops).is_ok());
+        assert!(bring_up_with(3, &mut ops, unreported).is_ok());
         assert_eq!(
             ops.steps,
             [
@@ -253,10 +267,57 @@ mod tests {
     }
 
     #[test]
+    fn every_failed_attempt_is_reported_as_it_happens_and_a_success_is_not() {
+        let mut ops = FakeOps::new(
+            vec![Err(BringUpError::NoDongle), Ok(()), Ok(())],
+            vec![Err(deaf()), Ok(LibConfigOutcome::Accepted)],
+        );
+        let mut reported = Vec::new();
+        assert!(
+            bring_up_with(3, &mut ops, |attempt, err| reported
+                .push((attempt, err.to_string())))
+            .is_ok()
+        );
+        assert_eq!(
+            reported,
+            [
+                (1, "no ANT+ dongle found".to_owned()),
+                (2, deaf().to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stick_that_is_listed_but_gone_is_a_missing_dongle_not_an_open_failure() {
+        assert!(matches!(
+            classify_open(UsbError::FailedToOpenDevice(rusb::Error::NoDevice)),
+            BringUpError::NoDongle
+        ));
+        assert!(matches!(
+            classify_open(UsbError::FailedToOpenDevice(rusb::Error::Busy)),
+            BringUpError::Open(UsbError::FailedToOpenDevice(rusb::Error::Busy))
+        ));
+        assert!(matches!(
+            classify_open(UsbError::FailedToReset(rusb::Error::NoDevice)),
+            BringUpError::Open(_)
+        ));
+    }
+
+    #[test]
+    fn an_open_failure_says_so_rather_than_posing_as_a_write() {
+        let text = BringUpError::Open(UsbError::FailedToOpenDevice(rusb::Error::Busy)).to_string();
+        assert!(
+            text.starts_with("the dongle could not be opened: "),
+            "{text}"
+        );
+        assert!(!text.contains("writing"), "{text}");
+    }
+
+    #[test]
     fn the_error_returned_is_the_last_attempts() {
         let mut ops = FakeOps::new(vec![Err(BringUpError::NoDongle), Ok(())], vec![Err(deaf())]);
         assert!(matches!(
-            bring_up_with(2, &mut ops),
+            bring_up_with(2, &mut ops, unreported),
             Err(BringUpError::Init(_))
         ));
         assert_eq!(
@@ -272,7 +333,7 @@ mod tests {
 
         let mut ops = FakeOps::new(vec![Ok(()), Err(BringUpError::NoDongle)], vec![Err(deaf())]);
         assert!(matches!(
-            bring_up_with(2, &mut ops),
+            bring_up_with(2, &mut ops, unreported),
             Err(BringUpError::NoDongle)
         ));
     }
@@ -281,7 +342,7 @@ mod tests {
     fn an_enumeration_failure_is_not_a_missing_dongle() {
         let mut ops = FakeOps::new(vec![Err(BringUpError::Enumerate(rusb::Error::Io))], vec![]);
         assert!(matches!(
-            bring_up_with(1, &mut ops),
+            bring_up_with(1, &mut ops, unreported),
             Err(BringUpError::Enumerate(_))
         ));
     }
@@ -290,7 +351,7 @@ mod tests {
     fn zero_attempts_means_one() {
         let mut ops = FakeOps::new(vec![Err(BringUpError::NoDongle)], vec![]);
         assert!(matches!(
-            bring_up_with(0, &mut ops),
+            bring_up_with(0, &mut ops, unreported),
             Err(BringUpError::NoDongle)
         ));
         assert_eq!(ops.steps, [Step::Open, Step::Reset]);

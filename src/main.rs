@@ -32,7 +32,9 @@ struct Args {
 }
 
 fn init_driver() -> Dongle {
-    match bring_up(INIT_ATTEMPTS) {
+    let report =
+        |attempt, err: &_| eprintln!("ERROR: {err} (attempt {attempt} of {INIT_ATTEMPTS})");
+    match bring_up(INIT_ATTEMPTS, report) {
         Ok(BringUp { driver, lib_config }) => {
             if let Some(warning) = lib_config.warning() {
                 eprintln!("WARNING: {warning}");
