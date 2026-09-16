@@ -65,19 +65,40 @@ impl fmt::Display for InitError {
 pub enum LibConfigOutcome {
     Accepted,
     /// A dongle that refuses it still works on the legacy extension, with
-    /// channel ids but no RSSI or RX timestamps.
+    /// channel ids but no RX timestamps.
     Rejected(MessageCode),
     /// It answered everything else, so it is listening; it just said nothing
     /// about this one.
     Unanswered,
 }
 
+impl LibConfigOutcome {
+    /// What to tell the operator when the step did not land: one line naming
+    /// what was lost, or nothing when it was accepted.
+    pub fn warning(&self) -> Option<String> {
+        const LOST: &str =
+            "no RX timestamps, so collision detection falls back to wall-clock timing";
+        match self {
+            Self::Accepted => None,
+            Self::Rejected(code) => {
+                Some(format!("the dongle rejected LibConfig ({code:?}); {LOST}"))
+            }
+            Self::Unanswered => Some(format!("the dongle did not answer LibConfig; {LOST}")),
+        }
+    }
+}
+
 /// Configure channel 0 as a promiscuous ANT+ receiver, confirming every step.
 ///
 /// The order of the last two is load-bearing: `EnableExtRxMessages` is the
 /// legacy switch and turns on the channel id block only, `LibConfig` supersedes
-/// it and adds RSSI and RX timestamps. Legacy first leaves a clone that ignores
+/// it and adds RX timestamps. Legacy first leaves a clone that ignores
 /// LibConfig still reporting channel ids.
+///
+/// RSSI is deliberately NOT requested. Every stick on the bench reports the AGC
+/// register rather than dBm, and that register was measured byte-identical
+/// from point-blank to out of range, so the block would cost three or four
+/// bytes a frame and tell nobody anything.
 pub fn configure<E, D: Driver<E>>(driver: &mut D) -> Result<LibConfigOutcome, InitError> {
     reset(driver)?;
 
@@ -141,7 +162,8 @@ fn reset<E, D: Driver<E>>(driver: &mut D) -> Result<(), InitError> {
 /// degrades rather than fails: the legacy switch above already carries channel
 /// ids, which is what the collision detector and the device registry need.
 fn lib_config<E, D: Driver<E>>(driver: &mut D) -> Result<LibConfigOutcome, InitError> {
-    send(driver, "LibConfig", &LibConfig::new(true, true, true))?;
+    // Channel id, no RSSI, RX timestamps.
+    send(driver, "LibConfig", &LibConfig::new(true, false, true))?;
     Ok(match await_response(driver, TxMessageId::LibConfig) {
         Some(MessageCode::ResponseNoError) => LibConfigOutcome::Accepted,
         Some(code) => LibConfigOutcome::Rejected(code),
@@ -207,6 +229,8 @@ mod tests {
         answers_reset: bool,
         answers: Vec<(TxMessageId, MessageCode)>,
         sent: Vec<TxMessageId>,
+        /// The packed bytes of the LibConfig it was sent, if any.
+        lib_config: Option<Vec<u8>>,
         pending: Vec<AntMessage>,
     }
 
@@ -229,6 +253,7 @@ mod tests {
                     (TxMessageId::LibConfig, MessageCode::ResponseNoError),
                 ],
                 sent: Vec::new(),
+                lib_config: None,
                 pending: Vec::new(),
             }
         }
@@ -238,6 +263,7 @@ mod tests {
                 answers_reset: false,
                 answers: Vec::new(),
                 sent: Vec::new(),
+                lib_config: None,
                 pending: Vec::new(),
             }
         }
@@ -272,6 +298,11 @@ mod tests {
         ) -> Result<(), DriverError<FakeError>> {
             let id = msg.get_tx_msg_id();
             self.sent.push(id);
+            if id == TxMessageId::LibConfig {
+                let mut buf = [0u8; 16];
+                let len = msg.serialize_message(&mut buf).expect("LibConfig packs");
+                self.lib_config = Some(buf[..len].to_vec());
+            }
             if id == TxMessageId::ResetSystem {
                 if self.answers_reset {
                     self.pending.push(startup());
@@ -307,6 +338,14 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    // Byte 1 of LibConfig: channel id (0x80), RSSI (0x40), RX timestamp (0x20).
+    #[test]
+    fn lib_config_asks_for_channel_ids_and_timestamps_but_not_rssi() {
+        let mut dongle = FakeDongle::healthy();
+        configure(&mut dongle).unwrap();
+        assert_eq!(dongle.lib_config.as_deref(), Some(&[0x00, 0xA0][..]));
     }
 
     #[test]

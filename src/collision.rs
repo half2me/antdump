@@ -123,6 +123,17 @@ impl CollisionDetector {
     pub fn reset(&mut self) {
         self.device_state.clear();
     }
+
+    /// Forget devices silent for longer than `ttl`. Keys come off the air, so
+    /// a long-running process otherwise holds every phantom number a garbled
+    /// frame ever minted. A message still in quarantine is never dropped.
+    pub fn evict_idle(&mut self, now: Instant, ttl: Duration) -> usize {
+        let before = self.device_state.len();
+        self.device_state.retain(|_, state| {
+            state.pending.is_some() || now.duration_since(state.last_wall) <= ttl
+        });
+        before - self.device_state.len()
+    }
 }
 
 fn is_collision(
@@ -355,6 +366,31 @@ mod tests {
         det.reset();
         assert!(det.flush_expired_at(t0 + Duration::from_secs(1)).is_empty());
         assert_eq!(det.dropped_count(), 2);
+    }
+
+    #[test]
+    fn evict_idle_forgets_silent_devices_but_never_a_quarantined_message() {
+        let mut det = CollisionDetector::new(THRESHOLD);
+        let t0 = Instant::now();
+        let ttl = Duration::from_secs(60);
+
+        det.feed_at(t0, key_a(), plain());
+        det.flush_expired_at(t0 + MIN_HOLD);
+        det.feed_at(t0 + Duration::from_secs(30), key_b(), plain());
+
+        // Key A is silent past the TTL; key B still holds a message.
+        assert_eq!(det.evict_idle(t0 + ttl + Duration::from_secs(1), ttl), 1);
+        assert_eq!(
+            det.flush_expired_at(t0 + ttl + Duration::from_secs(2))
+                .len(),
+            1
+        );
+        // Key A comes back as a new device: buffered, not collided against its old state.
+        assert!(
+            det.feed_at(t0 + ttl + Duration::from_secs(3), key_a(), plain())
+                .is_none()
+        );
+        assert_eq!(det.dropped_count(), 0);
     }
 
     #[test]
