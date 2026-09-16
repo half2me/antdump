@@ -1,4 +1,4 @@
-//! Bringing the first ANT+ dongle on the bus up, and bringing it back.
+//! Bringing an ANT+ dongle on the bus up, and bringing it back.
 //!
 //! A stale handle is the failure this module exists for. `UsbDriver::new`
 //! resets the handle it then claims the interface on, and a reset that
@@ -69,17 +69,81 @@ pub struct BringUp {
     pub lib_config: LibConfigOutcome,
 }
 
-/// The first ANT+ dongle on the bus, if any. `Err` is the bus itself failing
-/// to enumerate, which is not the same thing as an empty bus.
-pub fn find_dongle() -> Result<Option<Device<GlobalContext>>, rusb::Error> {
+/// One stick as the bus describes it, so two on one machine can be told apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DongleId {
+    /// Bus and port chain, `20-1.4`: the socket the stick is in, which a reset
+    /// and a replug into the same socket both keep.
+    pub port: String,
+    /// The USB serial string, when the stick reports one.
+    pub serial: Option<String>,
+}
+
+impl DongleId {
+    #[must_use]
+    pub fn of(device: &Device<GlobalContext>) -> Self {
+        let chain = device
+            .port_numbers()
+            .unwrap_or_default()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        let serial = device
+            .device_descriptor()
+            .ok()
+            .and_then(|desc| {
+                device
+                    .open()
+                    .ok()?
+                    .read_serial_number_string_ascii(&desc)
+                    .ok()
+            })
+            .filter(|serial| !serial.is_empty());
+        Self {
+            port: format!("{}-{chain}", device.bus_number()),
+            serial,
+        }
+    }
+
+    /// No selector takes any stick; a selector must equal the serial or the port.
+    #[must_use]
+    pub fn matches(&self, selector: Option<&str>) -> bool {
+        selector.is_none_or(|wanted| self.port == wanted || self.serial.as_deref() == Some(wanted))
+    }
+}
+
+impl fmt::Display for DongleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.serial {
+            Some(serial) => write!(f, "{} serial {serial}", self.port),
+            None => write!(f, "{} (no serial)", self.port),
+        }
+    }
+}
+
+/// Every ANT+ dongle on the bus.
+pub fn list_dongles() -> Result<Vec<DongleId>, rusb::Error> {
     Ok(rusb::DeviceList::new()?
         .iter()
-        .find(is_ant_usb_device_from_device))
+        .filter(is_ant_usb_device_from_device)
+        .map(|device| DongleId::of(&device))
+        .collect())
+}
+
+/// The first ANT+ dongle on the bus that the selector takes, if any. `Err`
+/// is the bus itself failing to enumerate, which is not the same thing as an
+/// empty bus.
+pub fn find_dongle(selector: Option<&str>) -> Result<Option<Device<GlobalContext>>, rusb::Error> {
+    Ok(rusb::DeviceList::new()?
+        .iter()
+        .filter(is_ant_usb_device_from_device)
+        .find(|device| selector.is_none() || DongleId::of(device).matches(selector)))
 }
 
 /// Reset the dongle at the USB level and let it re-enumerate.
-pub fn reset_dongle() {
-    if let Ok(Some(device)) = find_dongle()
+pub fn reset_dongle(selector: Option<&str>) {
+    if let Ok(Some(device)) = find_dongle(selector)
         && let Ok(handle) = device.open()
     {
         let _ = handle.reset();
@@ -88,9 +152,9 @@ pub fn reset_dongle() {
     std::thread::sleep(REENUMERATE_DELAY);
 }
 
-/// Open the first dongle on the bus without configuring it.
-pub fn open_dongle() -> Result<Dongle, BringUpError> {
-    let device = match find_dongle() {
+/// Open the dongle without configuring it.
+pub fn open_dongle(selector: Option<&str>) -> Result<Dongle, BringUpError> {
+    let device = match find_dongle(selector) {
         Ok(Some(device)) => device,
         Ok(None) => return Err(BringUpError::NoDongle),
         Err(err) => return Err(BringUpError::Enumerate(err)),
@@ -116,13 +180,15 @@ pub trait BringUpOps {
     fn reset(&mut self);
 }
 
-struct UsbOps;
+struct UsbOps<'a> {
+    selector: Option<&'a str>,
+}
 
-impl BringUpOps for UsbOps {
+impl BringUpOps for UsbOps<'_> {
     type Driver = Dongle;
 
     fn open(&mut self) -> Result<Dongle, BringUpError> {
-        open_dongle()
+        open_dongle(self.selector)
     }
 
     fn configure(&mut self, driver: &mut Dongle) -> Result<LibConfigOutcome, InitError> {
@@ -130,18 +196,21 @@ impl BringUpOps for UsbOps {
     }
 
     fn reset(&mut self) {
-        reset_dongle();
+        reset_dongle(self.selector);
     }
 }
 
 /// Bring the dongle up as a promiscuous ANT+ receiver, resetting and
-/// re-finding it between attempts. Each failed attempt goes to `report` with
-/// its one-based number; the error returned is the last one.
+/// re-finding it between attempts. `selector` names one stick by serial or
+/// port when several share the bus; `None` takes the first. Each failed
+/// attempt goes to `report` with its one-based number; the error returned is
+/// the last one.
 pub fn bring_up(
     attempts: u32,
+    selector: Option<&str>,
     report: impl FnMut(u32, &BringUpError),
 ) -> Result<BringUp, BringUpError> {
-    bring_up_with(attempts, &mut UsbOps, report)
+    bring_up_with(attempts, &mut UsbOps { selector }, report)
         .map(|(driver, lib_config)| BringUp { driver, lib_config })
 }
 
@@ -238,6 +307,29 @@ mod tests {
     }
 
     fn unreported(_: u32, _: &BringUpError) {}
+
+    #[test]
+    fn a_selector_names_a_stick_by_serial_or_by_port_and_no_selector_takes_any() {
+        let stick = DongleId {
+            port: "20-1.4".to_owned(),
+            serial: Some("1024".to_owned()),
+        };
+        assert!(stick.matches(None));
+        assert!(stick.matches(Some("1024")));
+        assert!(stick.matches(Some("20-1.4")));
+        assert!(!stick.matches(Some("1025")));
+        assert!(!stick.matches(Some("20-1")));
+        assert_eq!(stick.to_string(), "20-1.4 serial 1024");
+
+        let mute = DongleId {
+            port: "1-2".to_owned(),
+            serial: None,
+        };
+        assert!(mute.matches(None));
+        assert!(mute.matches(Some("1-2")));
+        assert!(!mute.matches(Some("")));
+        assert_eq!(mute.to_string(), "1-2 (no serial)");
+    }
 
     #[test]
     fn a_healthy_dongle_comes_up_on_the_first_attempt_without_a_reset() {

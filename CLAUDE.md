@@ -31,7 +31,7 @@ Docker build: `docker build -t antdump .`
 ## Architecture
 
 - **CLI args** (`src/main.rs`) — `clap` derive-based `Args` struct for `--server`,
-  `--hello_msg`, `--collision_threshold_ms` and `--quiet`
+  `--hello_msg`, `--collision_threshold_ms`, `--quiet`, `--dongle` and `--list-dongles`
 - **USB driver** — Uses `ant-rs` crate (`ant::drivers::UsbDriver`) from a git dependency to
   communicate with ANT+ USB dongles via `rusb`
 - **ANT+ protocol setup** — Channel 0 as shared receive-only with the ANT+ public network key,
@@ -44,8 +44,11 @@ Docker build: `docker build -t antdump .`
   (header + payload + every extended block the flag byte announces + checksum)
 - **`CollisionDetector`** (`src/collision.rs`) — Per-device quarantine that drops the
   garbled pairs some firmware produces when two transmissions overlap on the air
-- **`bring_up`** (`src/usb.rs`) — Finds, opens and configures the first dongle, resetting
-  and re-finding it between attempts. In the library, not the binary, because the raceble
+- **`bring_up`** (`src/usb.rs`) — Finds, opens and configures a dongle, resetting and
+  re-finding it between attempts. A selector (`DongleId`: the USB serial or the bus and
+  port chain, `20-1.4`) names one stick when several share the bus, and the reset honors
+  it too, since resetting the first stick found is how a second process on the same
+  machine knocks the first one deaf; `None` takes the first. In the library, not the binary, because the raceble
   receiver firmware (`racetogether/firmware`) runs the same loop forever and reports
   `NoDongle` and an init failure as two different states; `antdump` exits after three.
   The library never prints: each failed attempt goes to the caller's `report` callback,
