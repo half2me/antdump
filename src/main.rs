@@ -3,7 +3,7 @@ use ant::messages::RxMessage;
 use antdump::collision::CollisionDetector;
 use antdump::message::{DeviceKey, serialize_broadcast};
 use antdump::tcp::TcpWriter;
-use antdump::usb::{BringUp, Dongle, INIT_ATTEMPTS, bring_up};
+use antdump::usb::{BringUp, Dongle, INIT_ATTEMPTS, bring_up, list_dongles};
 use clap::Parser;
 use std::io;
 use std::time::Duration;
@@ -29,12 +29,33 @@ struct Args {
     /// Only show warnings (collisions, dropped packets, errors). Suppress per-packet output.
     #[arg(long, short)]
     quiet: bool,
+
+    /// Which dongle to use when several are plugged in: its USB serial or its
+    /// port as `--list-dongles` prints them. Default: the first found.
+    #[arg(long)]
+    dongle: Option<String>,
+
+    /// Print every ANT+ dongle on the bus and exit.
+    #[arg(long)]
+    list_dongles: bool,
 }
 
-fn init_driver() -> Dongle {
+fn print_dongles() -> io::Result<()> {
+    let dongles = list_dongles().map_err(io::Error::other)?;
+    if dongles.is_empty() {
+        eprintln!("no ANT+ dongle found");
+        std::process::exit(1);
+    }
+    for dongle in dongles {
+        println!("{dongle}");
+    }
+    Ok(())
+}
+
+fn init_driver(selector: Option<&str>) -> Dongle {
     let report =
         |attempt, err: &_| eprintln!("ERROR: {err} (attempt {attempt} of {INIT_ATTEMPTS})");
-    match bring_up(INIT_ATTEMPTS, report) {
+    match bring_up(INIT_ATTEMPTS, selector, report) {
         Ok(BringUp { driver, lib_config }) => {
             if let Some(warning) = lib_config.warning() {
                 eprintln!("WARNING: {warning}");
@@ -53,9 +74,12 @@ fn init_driver() -> Dongle {
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
+    if args.list_dongles {
+        return print_dongles();
+    }
     let writer = args.server.map(|url| TcpWriter::spawn(url, args.hello_msg));
     let quiet = args.quiet;
-    let mut driver = init_driver();
+    let mut driver = init_driver(args.dongle.as_deref());
     let mut collision = CollisionDetector::new(Duration::from_secs_f64(
         args.collision_threshold_ms / 1000.0,
     ));
