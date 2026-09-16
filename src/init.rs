@@ -229,6 +229,8 @@ mod tests {
         answers_reset: bool,
         answers: Vec<(TxMessageId, MessageCode)>,
         sent: Vec<TxMessageId>,
+        /// The packed bytes of the LibConfig it was sent, if any.
+        lib_config: Option<Vec<u8>>,
         pending: Vec<AntMessage>,
     }
 
@@ -251,6 +253,7 @@ mod tests {
                     (TxMessageId::LibConfig, MessageCode::ResponseNoError),
                 ],
                 sent: Vec::new(),
+                lib_config: None,
                 pending: Vec::new(),
             }
         }
@@ -260,6 +263,7 @@ mod tests {
                 answers_reset: false,
                 answers: Vec::new(),
                 sent: Vec::new(),
+                lib_config: None,
                 pending: Vec::new(),
             }
         }
@@ -294,6 +298,11 @@ mod tests {
         ) -> Result<(), DriverError<FakeError>> {
             let id = msg.get_tx_msg_id();
             self.sent.push(id);
+            if id == TxMessageId::LibConfig {
+                let mut buf = [0u8; 16];
+                let len = msg.serialize_message(&mut buf).expect("LibConfig packs");
+                self.lib_config = Some(buf[..len].to_vec());
+            }
             if id == TxMessageId::ResetSystem {
                 if self.answers_reset {
                     self.pending.push(startup());
@@ -329,6 +338,14 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    // Byte 1 of LibConfig: channel id (0x80), RSSI (0x40), RX timestamp (0x20).
+    #[test]
+    fn lib_config_asks_for_channel_ids_and_timestamps_but_not_rssi() {
+        let mut dongle = FakeDongle::healthy();
+        configure(&mut dongle).unwrap();
+        assert_eq!(dongle.lib_config.as_deref(), Some(&[0x00, 0xA0][..]));
     }
 
     #[test]

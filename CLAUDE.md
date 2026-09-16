@@ -75,7 +75,8 @@ did. So `usb::bring_up` retries: reset at the USB level, drop the handle, wait o
 re-enumeration, look the device up again. `antdump` gives it three attempts, then exits
 non-zero rather than sit there configured into the void.
 
-**Bench results (two genuine Dynastream sticks, 0fcf:1009 and 0fcf:1008, 307 frames):** the
+**Bench results (two genuine Dynastream sticks, 0fcf:1009 and 0fcf:1008, 307 frames, captured
+while LibConfig still requested RSSI; today's frames carry two blocks, `flag=A0`):** the
 order lands — `flag=E0`, all three blocks, on every frame. Both answered LibConfig with
 `ResponseNoError` in 1.8 ms and 10.4 ms, so the 500 ms window is generous. Both report **AGC**
 RSSI (`0x10`, 4 bytes), so the dBm branch is still unexercised, and no clone was available, so
