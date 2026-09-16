@@ -47,7 +47,12 @@ Docker build: `docker build -t antdump .`
 - **`bring_up`** (`src/usb.rs`) — Finds, opens and configures the first dongle, resetting
   and re-finding it between attempts. In the library, not the binary, because the raceble
   receiver firmware (`racetogether/firmware`) runs the same loop forever and reports
-  `NoDongle` and an init failure as two different states; `antdump` exits after three
+  `NoDongle` and an init failure as two different states; `antdump` exits after three.
+  The library never prints: each failed attempt goes to the caller's `report` callback,
+  so the receiver logs it with a timestamp and `antdump` writes it to stderr
+- **`probe_channel`** (`src/init.rs`) — A channel status request for a caller that has heard
+  nothing for a while: silence on an open channel is also what an empty room sounds like, so
+  this is how a stick that went deaf mid-run is told apart from one with nothing to hear
 
 ### Extended RX data: the ORDER of the two enable messages matters
 
@@ -74,6 +79,13 @@ invalidates that handle — libusb's own answer is to close it and rediscover, w
 did. So `usb::bring_up` retries: reset at the USB level, drop the handle, wait out
 re-enumeration, look the device up again. `antdump` gives it three attempts, then exits
 non-zero rather than sit there configured into the void.
+
+**Passing the reset probe once proves nothing about later.** On a laptop, a stick pulled
+mid-race and plugged back in answered its reset, accepted every configuration message and
+then delivered nothing for as long as it was left; a process restart found it not answering
+a reset at all. A long-running caller therefore cannot treat "dongle up" as settled:
+`probe_channel` asks the stick for channel 0's status whenever the air has been quiet for a
+few seconds, and a missing answer or a channel that is not open means bring it up again.
 
 **Bench results (two genuine Dynastream sticks, 0fcf:1009 and 0fcf:1008, 307 frames, captured
 while LibConfig still requested RSSI; today's frames carry two blocks, `flag=A0`):** the

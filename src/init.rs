@@ -10,7 +10,9 @@
 //! So every message the channel depends on is confirmed here. A reset always
 //! produces a startup notification, which makes it the probe: nothing coming
 //! back from it means the dongle is not listening, and no amount of further
-//! configuration will change that.
+//! configuration will change that. Passing it once settles nothing for later:
+//! a stick plugged back in mid-run has answered its reset and then delivered
+//! nothing, so a quiet caller asks again with [`probe_channel`].
 
 use ant::drivers::Driver;
 use ant::messages::channel::MessageCode;
@@ -18,8 +20,9 @@ use ant::messages::config::{
     AssignChannel, ChannelId, ChannelRfFrequency, ChannelType, DeviceType, EnableExtRxMessages,
     LibConfig, SetNetworkKey, TransmissionType,
 };
-use ant::messages::control::{OpenRxScanMode, ResetSystem};
-use ant::messages::{RxMessage, TransmitableMessage, TxMessageId};
+use ant::messages::control::{OpenRxScanMode, RequestMessage, RequestableMessageId, ResetSystem};
+use ant::messages::requested_response::ChannelState;
+use ant::messages::{AntMessage, RxMessage, TransmitableMessage, TxMessageId};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -43,6 +46,9 @@ pub enum InitError {
     },
     /// The write itself failed.
     Write { message: &'static str },
+    /// It answered a status request, and the channel it was configured with
+    /// is no longer open.
+    ChannelClosed { state: ChannelState },
 }
 
 impl fmt::Display for InitError {
@@ -56,6 +62,10 @@ impl fmt::Display for InitError {
                 write!(f, "the dongle rejected {message}: {code:?}")
             }
             Self::Write { message } => write!(f, "writing {message} to the dongle failed"),
+            Self::ChannelClosed { state } => write!(
+                f,
+                "the dongle reports its channel as {state:?} rather than open, so no data will arrive"
+            ),
         }
     }
 }
@@ -158,6 +168,36 @@ fn reset<E, D: Driver<E>>(driver: &mut D) -> Result<(), InitError> {
     Err(InitError::Deaf { message: "a reset" })
 }
 
+/// Is channel 0 still open? `Ok` means the air is merely quiet. Broadcasts
+/// arriving while the answer is awaited go to `passthrough`, not the floor.
+pub fn probe_channel<E, D: Driver<E>>(
+    driver: &mut D,
+    mut passthrough: impl FnMut(AntMessage),
+) -> Result<(), InitError> {
+    send(
+        driver,
+        "a channel status request",
+        &RequestMessage::new(0, RequestableMessageId::ChannelStatus, None),
+    )?;
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Ok(Some(msg)) = driver.get_message() {
+            match msg.message {
+                RxMessage::ChannelStatus(status) if status.channel_number == 0 => {
+                    return match status.channel_state {
+                        ChannelState::Searching | ChannelState::Tracking => Ok(()),
+                        state => Err(InitError::ChannelClosed { state }),
+                    };
+                }
+                _ => passthrough(msg),
+            }
+        }
+    }
+    Err(InitError::Deaf {
+        message: "a channel status request",
+    })
+}
+
 /// LibConfig is the one step the channel does not depend on, so a refusal
 /// degrades rather than fails: the legacy switch above already carries channel
 /// ids, which is what the collision detector and the device registry need.
@@ -217,7 +257,9 @@ mod tests {
     use super::*;
     use ant::drivers::DriverError;
     use ant::messages::channel::ChannelResponse;
+    use ant::messages::data::BroadcastData;
     use ant::messages::notifications::StartUpMessage;
+    use ant::messages::requested_response::ChannelStatus;
     use ant::messages::{AntMessage, RxMessage};
 
     #[derive(Debug)]
@@ -228,6 +270,8 @@ mod tests {
     struct FakeDongle {
         answers_reset: bool,
         answers: Vec<(TxMessageId, MessageCode)>,
+        /// What a channel status request is answered with; `None` is silence.
+        channel_state: Option<ChannelState>,
         sent: Vec<TxMessageId>,
         /// The packed bytes of the LibConfig it was sent, if any.
         lib_config: Option<Vec<u8>>,
@@ -238,6 +282,7 @@ mod tests {
         fn healthy() -> Self {
             Self {
                 answers_reset: true,
+                channel_state: Some(ChannelState::Searching),
                 answers: vec![
                     (TxMessageId::SetNetworkKey, MessageCode::ResponseNoError),
                     (TxMessageId::AssignChannel, MessageCode::ResponseNoError),
@@ -262,10 +307,16 @@ mod tests {
             Self {
                 answers_reset: false,
                 answers: Vec::new(),
+                channel_state: None,
                 sent: Vec::new(),
                 lib_config: None,
                 pending: Vec::new(),
             }
+        }
+
+        fn with_channel(mut self, state: ChannelState) -> Self {
+            self.channel_state = Some(state);
+            self
         }
 
         fn without(mut self, id: TxMessageId) -> Self {
@@ -309,6 +360,12 @@ mod tests {
                 }
                 return Ok(());
             }
+            if id == TxMessageId::RequestMessage {
+                if let Some(state) = self.channel_state {
+                    self.pending.push(channel_status(state));
+                }
+                return Ok(());
+            }
             if let Some((_, code)) = self.answers.iter().find(|(msg_id, _)| *msg_id == id) {
                 self.pending.push(response(id, *code));
             }
@@ -338,6 +395,61 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn channel_status(state: ChannelState) -> AntMessage {
+        AntMessage {
+            message: RxMessage::ChannelStatus(ChannelStatus {
+                channel_number: 0,
+                channel_type: ChannelType::SharedReceiveOnly,
+                network_number: 0,
+                channel_state: state,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn broadcast() -> AntMessage {
+        AntMessage {
+            message: RxMessage::BroadcastData(BroadcastData::default()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_open_channel_answers_the_probe_and_a_closed_or_silent_one_fails_it() {
+        let mut dongle = FakeDongle::healthy();
+        assert_eq!(probe_channel(&mut dongle, |_| {}), Ok(()));
+        assert_eq!(dongle.sent, vec![TxMessageId::RequestMessage]);
+
+        let mut dongle = FakeDongle::healthy().with_channel(ChannelState::Tracking);
+        assert_eq!(probe_channel(&mut dongle, |_| {}), Ok(()));
+
+        let mut dongle = FakeDongle::healthy().with_channel(ChannelState::Assigned);
+        assert_eq!(
+            probe_channel(&mut dongle, |_| {}),
+            Err(InitError::ChannelClosed {
+                state: ChannelState::Assigned
+            })
+        );
+
+        let mut dongle = FakeDongle::silent();
+        assert_eq!(
+            probe_channel(&mut dongle, |_| {}),
+            Err(InitError::Deaf {
+                message: "a channel status request"
+            })
+        );
+    }
+
+    #[test]
+    fn a_broadcast_arriving_during_the_probe_is_handed_on_not_dropped() {
+        let mut dongle = FakeDongle::healthy();
+        dongle.pending.push(broadcast());
+        let mut passed = Vec::new();
+        assert_eq!(probe_channel(&mut dongle, |msg| passed.push(msg)), Ok(()));
+        assert_eq!(passed.len(), 1);
+        assert!(matches!(passed[0].message, RxMessage::BroadcastData(_)));
     }
 
     // Byte 1 of LibConfig: channel id (0x80), RSSI (0x40), RX timestamp (0x20).
