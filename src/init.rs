@@ -72,6 +72,22 @@ pub enum LibConfigOutcome {
     Unanswered,
 }
 
+impl LibConfigOutcome {
+    /// What to tell the operator when the step did not land: one line naming
+    /// what was lost, or nothing when it was accepted.
+    pub fn warning(&self) -> Option<String> {
+        const LOST: &str =
+            "no RSSI or RX timestamps, and collision detection falls back to wall-clock timing";
+        match self {
+            Self::Accepted => None,
+            Self::Rejected(code) => {
+                Some(format!("the dongle rejected LibConfig ({code:?}); {LOST}"))
+            }
+            Self::Unanswered => Some(format!("the dongle did not answer LibConfig; {LOST}")),
+        }
+    }
+}
+
 /// Configure channel 0 as a promiscuous ANT+ receiver, confirming every step.
 ///
 /// The order of the last two is load-bearing: `EnableExtRxMessages` is the

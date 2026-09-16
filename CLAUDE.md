@@ -44,6 +44,10 @@ Docker build: `docker build -t antdump .`
   (header + payload + every extended block the flag byte announces + checksum)
 - **`CollisionDetector`** (`src/collision.rs`) — Per-device quarantine that drops the
   garbled pairs some firmware produces when two transmissions overlap on the air
+- **`bring_up`** (`src/usb.rs`) — Finds, opens and configures the first dongle, resetting
+  and re-finding it between attempts. In the library, not the binary, because the raceble
+  receiver firmware (`racetogether/firmware`) runs the same loop forever and reports
+  `NoDongle` and an init failure as two different states; `antdump` exits after three
 
 ### Extended RX data: the ORDER of the two enable messages matters
 
@@ -64,9 +68,9 @@ failure, since the legacy switch already carries channel ids.
 restart antdump and the stick stays silent until it is physically unplugged. `UsbDriver::new`
 resets the handle it then claims the interface on, and a reset that re-enumerates the device
 invalidates that handle — libusb's own answer is to close it and rediscover, which nothing
-did. So `init_driver` retries: reset at the USB level, drop the handle, wait out
-re-enumeration, look the device up again. Three attempts, then exit non-zero rather than sit
-there configured into the void.
+did. So `usb::bring_up` retries: reset at the USB level, drop the handle, wait out
+re-enumeration, look the device up again. `antdump` gives it three attempts, then exits
+non-zero rather than sit there configured into the void.
 
 **Bench results (two genuine Dynastream sticks, 0fcf:1009 and 0fcf:1008, 307 frames):** the
 order lands — `flag=E0`, all three blocks, on every frame. Both answered LibConfig with

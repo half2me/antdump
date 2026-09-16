@@ -1,9 +1,9 @@
-use ant::drivers::*;
+use ant::drivers::Driver;
 use ant::messages::RxMessage;
 use antdump::collision::CollisionDetector;
-use antdump::init::{InitError, LibConfigOutcome, configure};
 use antdump::message::{DeviceKey, serialize_broadcast};
 use antdump::tcp::TcpWriter;
+use antdump::usb::{BringUp, Dongle, INIT_ATTEMPTS, bring_up};
 use clap::Parser;
 use std::io;
 use std::time::Duration;
@@ -31,84 +31,22 @@ struct Args {
     quiet: bool,
 }
 
-/// How many times to bring the dongle up before giving up. A stale handle is
-/// cleared by a port reset and a fresh look at the bus, which is what the
-/// retry does; more than a couple of failures is a dongle that needs a human.
-const INIT_ATTEMPTS: u32 = 3;
-
-/// A port reset re-enumerates the device, so it is gone from the bus for a
-/// moment and has to be found again rather than reused.
-const REENUMERATE_DELAY: Duration = Duration::from_millis(500);
-
-fn find_dongle() -> Option<rusb::Device<rusb::GlobalContext>> {
-    rusb::DeviceList::new()
-        .ok()?
-        .iter()
-        .find(is_ant_usb_device_from_device)
-}
-
-/// Reset the dongle at the USB level and let it re-enumerate.
-///
-/// `UsbDriver::new` resets the handle it then claims the interface on, and a
-/// reset that re-enumerates invalidates that handle: libusb's own answer is to
-/// close it and rediscover the device, which nothing did. That is the state a
-/// restarted process inherited, where every write succeeded and no answer ever
-/// came back and only unplugging the stick cleared it.
-fn reset_dongle() {
-    if let Some(device) = find_dongle()
-        && let Ok(handle) = device.open()
-    {
-        let _ = handle.reset();
-    }
-    // The handle is dropped here, which is the half that was missing.
-    std::thread::sleep(REENUMERATE_DELAY);
-}
-
-fn open_dongle() -> Result<UsbDriver<rusb::GlobalContext>, InitError> {
-    let device = find_dongle().ok_or(InitError::Write {
-        message: "no ANT+ dongle found",
-    })?;
-    UsbDriver::new(device).map_err(|_| InitError::Write {
-        message: "the dongle could not be opened",
-    })
-}
-
-fn init_driver() -> UsbDriver<rusb::GlobalContext> {
-    for attempt in 1..=INIT_ATTEMPTS {
-        let mut driver = match open_dongle() {
-            Ok(driver) => driver,
-            Err(err) => {
-                eprintln!("ERROR: {err}");
-                reset_dongle();
-                continue;
+fn init_driver() -> Dongle {
+    match bring_up(INIT_ATTEMPTS) {
+        Ok(BringUp { driver, lib_config }) => {
+            if let Some(warning) = lib_config.warning() {
+                eprintln!("WARNING: {warning}");
             }
-        };
-
-        match configure(&mut driver) {
-            Ok(outcome) => {
-                match outcome {
-                    LibConfigOutcome::Accepted => (),
-                    LibConfigOutcome::Rejected(code) => eprintln!(
-                        "WARNING: the dongle rejected LibConfig ({code:?}); no RSSI or RX timestamps, and collision detection falls back to wall-clock timing"
-                    ),
-                    LibConfigOutcome::Unanswered => eprintln!(
-                        "WARNING: the dongle did not answer LibConfig; no RSSI or RX timestamps, and collision detection falls back to wall-clock timing"
-                    ),
-                }
-                return driver;
-            }
-            Err(err) => {
-                eprintln!("ERROR: {err} (attempt {attempt} of {INIT_ATTEMPTS})");
-                drop(driver);
-                reset_dongle();
-            }
+            driver
+        }
+        Err(err) => {
+            // Exiting is the honest outcome: a supervisor can restart us, and a
+            // restart now stands a chance because each attempt reset the device
+            // properly.
+            eprintln!("FATAL: {err}. Unplug the dongle and plug it back in.");
+            std::process::exit(1);
         }
     }
-
-    // Exiting is the honest outcome: a supervisor can restart us, and a restart
-    // now stands a chance because each attempt above reset the device properly.
-    eprintln!("FATAL: the dongle never answered. Unplug it and plug it back in.");
-    std::process::exit(1);
 }
 
 fn main() -> io::Result<()> {
