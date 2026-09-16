@@ -95,7 +95,16 @@ pub fn open_dongle() -> Result<Dongle, BringUpError> {
         Ok(None) => return Err(BringUpError::NoDongle),
         Err(err) => return Err(BringUpError::Enumerate(err)),
     };
-    UsbDriver::new(device).map_err(BringUpError::Open)
+    UsbDriver::new(device).map_err(classify_open)
+}
+
+/// libusb can still list a stick that has just been pulled (seen on macOS),
+/// so an open that finds no device is a missing dongle, not a broken one.
+fn classify_open(err: UsbError) -> BringUpError {
+    match err {
+        UsbError::FailedToOpenDevice(rusb::Error::NoDevice) => BringUpError::NoDongle,
+        err => BringUpError::Open(err),
+    }
 }
 
 /// The three operations the retry loop is made of, so the loop itself can be
@@ -276,6 +285,22 @@ mod tests {
                 (2, deaf().to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn a_stick_that_is_listed_but_gone_is_a_missing_dongle_not_an_open_failure() {
+        assert!(matches!(
+            classify_open(UsbError::FailedToOpenDevice(rusb::Error::NoDevice)),
+            BringUpError::NoDongle
+        ));
+        assert!(matches!(
+            classify_open(UsbError::FailedToOpenDevice(rusb::Error::Busy)),
+            BringUpError::Open(UsbError::FailedToOpenDevice(rusb::Error::Busy))
+        ));
+        assert!(matches!(
+            classify_open(UsbError::FailedToReset(rusb::Error::NoDevice)),
+            BringUpError::Open(_)
+        ));
     }
 
     #[test]
