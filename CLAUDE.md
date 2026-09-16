@@ -51,11 +51,14 @@ Docker build: `docker build -t antdump .`
 
 ### Extended RX data: the ORDER of the two enable messages matters
 
-`init_driver` sends `EnableExtRxMessages` and THEN `LibConfig`, and that order is load-bearing.
+`configure` sends `EnableExtRxMessages` and THEN `LibConfig`, and that order is load-bearing.
 `EnableExtRxMessages` is the legacy switch and turns on the channel id block only; `LibConfig`
-supersedes it and is the only way to get RSSI and RX timestamps. Legacy first means a clone
+supersedes it and is the only way to get RX timestamps. Legacy first means a clone
 dongle that quietly ignores LibConfig still reports channel ids, while real firmware ends up
-with all three blocks because LibConfig lands last. Failure is logged, never fatal.
+with both blocks because LibConfig lands last. Failure is logged, never fatal. **RSSI is not
+requested at all** (`LibConfig::new(true, false, true)`): the register never moved on any
+stick we own (below), so the block would only cost bytes. `serialize_broadcast` still writes
+one back if a dongle sends it anyway.
 
 **Whether the dongle ACCEPTED anything is a separate message.** `send_message` returns once
 the bytes are on the bulk endpoint, so its `Ok` means "written", not "accepted". `src/init.rs`

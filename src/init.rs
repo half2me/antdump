@@ -65,7 +65,7 @@ impl fmt::Display for InitError {
 pub enum LibConfigOutcome {
     Accepted,
     /// A dongle that refuses it still works on the legacy extension, with
-    /// channel ids but no RSSI or RX timestamps.
+    /// channel ids but no RX timestamps.
     Rejected(MessageCode),
     /// It answered everything else, so it is listening; it just said nothing
     /// about this one.
@@ -77,7 +77,7 @@ impl LibConfigOutcome {
     /// what was lost, or nothing when it was accepted.
     pub fn warning(&self) -> Option<String> {
         const LOST: &str =
-            "no RSSI or RX timestamps, and collision detection falls back to wall-clock timing";
+            "no RX timestamps, so collision detection falls back to wall-clock timing";
         match self {
             Self::Accepted => None,
             Self::Rejected(code) => {
@@ -92,8 +92,13 @@ impl LibConfigOutcome {
 ///
 /// The order of the last two is load-bearing: `EnableExtRxMessages` is the
 /// legacy switch and turns on the channel id block only, `LibConfig` supersedes
-/// it and adds RSSI and RX timestamps. Legacy first leaves a clone that ignores
+/// it and adds RX timestamps. Legacy first leaves a clone that ignores
 /// LibConfig still reporting channel ids.
+///
+/// RSSI is deliberately NOT requested. Every stick on the bench reports the AGC
+/// register rather than dBm, and that register was measured byte-identical
+/// from point-blank to out of range, so the block would cost three or four
+/// bytes a frame and tell nobody anything.
 pub fn configure<E, D: Driver<E>>(driver: &mut D) -> Result<LibConfigOutcome, InitError> {
     reset(driver)?;
 
@@ -157,7 +162,8 @@ fn reset<E, D: Driver<E>>(driver: &mut D) -> Result<(), InitError> {
 /// degrades rather than fails: the legacy switch above already carries channel
 /// ids, which is what the collision detector and the device registry need.
 fn lib_config<E, D: Driver<E>>(driver: &mut D) -> Result<LibConfigOutcome, InitError> {
-    send(driver, "LibConfig", &LibConfig::new(true, true, true))?;
+    // Channel id, no RSSI, RX timestamps.
+    send(driver, "LibConfig", &LibConfig::new(true, false, true))?;
     Ok(match await_response(driver, TxMessageId::LibConfig) {
         Some(MessageCode::ResponseNoError) => LibConfigOutcome::Accepted,
         Some(code) => LibConfigOutcome::Rejected(code),
