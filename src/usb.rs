@@ -99,7 +99,7 @@ impl DongleId {
                     .read_serial_number_string_ascii(&desc)
                     .ok()
             })
-            .filter(|serial| !serial.is_empty());
+            .and_then(|raw| clean_serial(&raw));
         Self {
             port: format!("{}-{chain}", device.bus_number()),
             serial,
@@ -111,6 +111,15 @@ impl DongleId {
     pub fn matches(&self, selector: Option<&str>) -> bool {
         selector.is_none_or(|wanted| self.port == wanted || self.serial.as_deref() == Some(wanted))
     }
+}
+
+/// A stick's serial descriptor can claim more bytes than it sends, so libusb
+/// hands back the serial, a NUL and whatever its buffer held behind it (both
+/// Dynastream sticks on the bench did this). The serial is what is before
+/// the NUL.
+fn clean_serial(raw: &str) -> Option<String> {
+    let serial = raw.split('\0').next().unwrap_or_default().trim();
+    (!serial.is_empty()).then(|| serial.to_owned())
 }
 
 impl fmt::Display for DongleId {
@@ -329,6 +338,18 @@ mod tests {
         assert!(mute.matches(Some("1-2")));
         assert!(!mute.matches(Some("")));
         assert_eq!(mute.to_string(), "1-2 (no serial)");
+    }
+
+    #[test]
+    fn a_serial_is_what_the_stick_sent_before_the_nul_and_the_buffer_junk_behind_it() {
+        assert_eq!(clean_serial("1550803364\0").as_deref(), Some("1550803364"));
+        assert_eq!(
+            clean_serial("168\0?c?\0\0\0?c?\0\0DSI\0H").as_deref(),
+            Some("168")
+        );
+        assert_eq!(clean_serial(" 42 ").as_deref(), Some("42"));
+        assert_eq!(clean_serial(""), None);
+        assert_eq!(clean_serial("\0DSI"), None);
     }
 
     #[test]

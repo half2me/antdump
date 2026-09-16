@@ -48,7 +48,9 @@ Docker build: `docker build -t antdump .`
   re-finding it between attempts. A selector (`DongleId`: the USB serial or the bus and
   port chain, `20-1.4`) names one stick when several share the bus, and the reset honors
   it too, since resetting the first stick found is how a second process on the same
-  machine knocks the first one deaf; `None` takes the first. In the library, not the binary, because the raceble
+  machine knocks the first one deaf; `None` takes the first. The serial is what the stick
+  sends before the first NUL: both bench sticks claim a longer descriptor than they fill, so
+  libusb returns the serial, a NUL and stale buffer bytes. In the library, not the binary, because the raceble
   receiver firmware (`racetogether/firmware`) runs the same loop forever and reports
   `NoDongle` and an init failure as two different states; `antdump` exits after three.
   The library never prints: each failed attempt goes to the caller's `report` callback,
