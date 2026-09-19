@@ -15,9 +15,16 @@ cargo test               # Unit + pipeline tests
 cargo run                # Run (auto-detects first ANT+ USB dongle)
 cargo run -- --server <host:port>                  # Forward data to TCP server
 cargo run -- --server <host:port> --hello_msg <msg> # Send hello before streaming
-cargo fmt                # Format code
-cargo clippy             # Lint
+cargo fmt --check        # What CI checks
+cargo clippy --all-targets --locked -- -D warnings   # What CI GATES on
 ```
+
+**CI's clippy is a gate, not an annotation.** It used to run through
+`giraffate/clippy-action`, which defaults to `fail_on_error: false` and to
+`filter_mode: added` — so findings were annotations on changed lines that never failed
+the job, and `--all-targets` was never passed, so test code went unlinted. The receiver
+firmware that consumes this crate runs exactly the command above and fails on it, so
+running anything weaker here just moved the discovery downstream.
 
 **`Cargo.lock` is committed and `ant` is pinned by rev.** This crate ships as fleet
 firmware, so a rebuild of a released tag must resolve the same dependency tree; an

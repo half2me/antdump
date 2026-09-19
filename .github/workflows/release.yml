@@ -12,7 +12,7 @@ jobs:
     name: Create GH Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: gh release create ${{ github.ref_name }} --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -27,7 +27,10 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: antdump
             asset_name: antdump-darwin-aarch64
-          - os: macos-13
+          # macos-13 was RETIRED: GitHub supports only the latest two macOS
+          # versions and it is gone from the available-images list, so this leg
+          # would fail on an unresolvable label. macos-15-intel is the x64 one.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact_name: antdump
             asset_name: antdump-darwin-x86_64
@@ -47,7 +50,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     name: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -55,7 +58,7 @@ jobs:
 
       - name: Install cross compiler
         if: ${{ matrix.cross }}
-        run: cargo install cross
+        run: cargo install cross --locked
 
       - run: cross build --release --target ${{ matrix.target }}
         if: ${{ matrix.cross }}
