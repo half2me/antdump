@@ -14,7 +14,7 @@
 //! runs it forever, reporting "missing" and "error" as two different states,
 //! while `antdump` itself gives up after a few attempts and exits.
 
-use crate::init::{InitError, LibConfigOutcome, configure};
+use crate::init::{InitError, configure};
 use ant::drivers::{UsbDriver, UsbError, is_ant_usb_device_from_device};
 use rusb::{Device, GlobalContext};
 use std::fmt;
@@ -61,13 +61,6 @@ impl fmt::Display for BringUpError {
 }
 
 impl std::error::Error for BringUpError {}
-
-/// A dongle that is configured and listening, plus what became of the one
-/// optional configuration step.
-pub struct BringUp {
-    pub driver: Dongle,
-    pub lib_config: LibConfigOutcome,
-}
 
 /// One stick as the bus describes it, so two on one machine can be told apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,7 +178,7 @@ fn classify_open(err: UsbError) -> BringUpError {
 pub trait BringUpOps {
     type Driver;
     fn open(&mut self) -> Result<Self::Driver, BringUpError>;
-    fn configure(&mut self, driver: &mut Self::Driver) -> Result<LibConfigOutcome, InitError>;
+    fn configure(&mut self, driver: &mut Self::Driver) -> Result<(), InitError>;
     fn reset(&mut self);
 }
 
@@ -200,7 +193,7 @@ impl BringUpOps for UsbOps<'_> {
         open_dongle(self.selector)
     }
 
-    fn configure(&mut self, driver: &mut Dongle) -> Result<LibConfigOutcome, InitError> {
+    fn configure(&mut self, driver: &mut Dongle) -> Result<(), InitError> {
         configure(driver)
     }
 
@@ -218,9 +211,8 @@ pub fn bring_up(
     attempts: u32,
     selector: Option<&str>,
     report: impl FnMut(u32, &BringUpError),
-) -> Result<BringUp, BringUpError> {
+) -> Result<Dongle, BringUpError> {
     bring_up_with(attempts, &mut UsbOps { selector }, report)
-        .map(|(driver, lib_config)| BringUp { driver, lib_config })
 }
 
 /// [`bring_up`] over any set of operations.
@@ -228,7 +220,7 @@ pub fn bring_up_with<O: BringUpOps>(
     attempts: u32,
     ops: &mut O,
     mut report: impl FnMut(u32, &BringUpError),
-) -> Result<(O::Driver, LibConfigOutcome), BringUpError> {
+) -> Result<O::Driver, BringUpError> {
     let attempts = attempts.max(1);
     let mut last = BringUpError::NoDongle;
     for attempt in 1..=attempts {
@@ -243,7 +235,7 @@ pub fn bring_up_with<O: BringUpOps>(
         };
 
         match ops.configure(&mut driver) {
-            Ok(lib_config) => return Ok((driver, lib_config)),
+            Ok(()) => return Ok(driver),
             Err(err) => {
                 let err = BringUpError::Init(err);
                 report(attempt, &err);
@@ -274,14 +266,14 @@ mod tests {
     /// what the loop did with them.
     struct FakeOps {
         opens: VecDeque<Result<(), BringUpError>>,
-        configures: VecDeque<Result<LibConfigOutcome, InitError>>,
+        configures: VecDeque<Result<(), InitError>>,
         steps: Vec<Step>,
     }
 
     impl FakeOps {
         fn new(
             opens: Vec<Result<(), BringUpError>>,
-            configures: Vec<Result<LibConfigOutcome, InitError>>,
+            configures: Vec<Result<(), InitError>>,
         ) -> Self {
             Self {
                 opens: opens.into(),
@@ -299,7 +291,7 @@ mod tests {
             self.opens.pop_front().expect("more opens than scripted")
         }
 
-        fn configure(&mut self, (): &mut ()) -> Result<LibConfigOutcome, InitError> {
+        fn configure(&mut self, (): &mut ()) -> Result<(), InitError> {
             self.steps.push(Step::Configure);
             self.configures
                 .pop_front()
@@ -354,18 +346,14 @@ mod tests {
 
     #[test]
     fn a_healthy_dongle_comes_up_on_the_first_attempt_without_a_reset() {
-        let mut ops = FakeOps::new(vec![Ok(())], vec![Ok(LibConfigOutcome::Unanswered)]);
-        let ((), outcome) = bring_up_with(3, &mut ops, unreported).unwrap();
-        assert_eq!(outcome, LibConfigOutcome::Unanswered);
+        let mut ops = FakeOps::new(vec![Ok(())], vec![Ok(())]);
+        bring_up_with(3, &mut ops, unreported).unwrap();
         assert_eq!(ops.steps, [Step::Open, Step::Configure]);
     }
 
     #[test]
     fn a_deaf_dongle_is_reset_and_re_found_between_attempts() {
-        let mut ops = FakeOps::new(
-            vec![Ok(()), Ok(())],
-            vec![Err(deaf()), Ok(LibConfigOutcome::Accepted)],
-        );
+        let mut ops = FakeOps::new(vec![Ok(()), Ok(())], vec![Err(deaf()), Ok(())]);
         assert!(bring_up_with(3, &mut ops, unreported).is_ok());
         assert_eq!(
             ops.steps,
@@ -383,7 +371,7 @@ mod tests {
     fn every_failed_attempt_is_reported_as_it_happens_and_a_success_is_not() {
         let mut ops = FakeOps::new(
             vec![Err(BringUpError::NoDongle), Ok(()), Ok(())],
-            vec![Err(deaf()), Ok(LibConfigOutcome::Accepted)],
+            vec![Err(deaf()), Ok(())],
         );
         let mut reported = Vec::new();
         assert!(
