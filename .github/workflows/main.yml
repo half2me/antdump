@@ -9,32 +9,37 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    name: stable / fmt
+    name: stable / fmt + clippy
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - name: cargo clippy
-        uses: giraffate/clippy-action@v1
-        with:
-          reporter: 'github-pr-check'
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+      # A gate rather than an annotation. This was giraffate/clippy-action,
+      # which defaults to `fail_on_error: false` — so a finding never failed
+      # the job — and to `filter_mode: added`, so it only looked at changed
+      # lines, with no --all-targets to reach the tests. This crate ships as
+      # fleet firmware and the receiver that consumes it runs exactly this
+      # command, so the two now agree.
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
   build:
     runs-on: ubuntu-latest
     name: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
 
   test:
     runs-on: ubuntu-latest
     name: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
