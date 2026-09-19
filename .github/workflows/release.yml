@@ -23,17 +23,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Apple Silicon only, on whatever macOS is current: `macos-latest` is
+          # the arm64 image. There is deliberately no x86_64-apple-darwin leg.
+          # GitHub keeps only the latest two macOS versions, so the Intel images
+          # age out from under a pin (macos-13 is already gone and macos-14 is
+          # deprecated), and nobody needs the asset; an Intel Mac can build it
+          # with `cargo build --release`.
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: antdump
             asset_name: antdump-darwin-aarch64
-          # macos-13 was RETIRED: GitHub supports only the latest two macOS
-          # versions and it is gone from the available-images list, so this leg
-          # would fail on an unresolvable label. macos-15-intel is the x64 one.
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact_name: antdump
-            asset_name: antdump-darwin-x86_64
 #          - os: windows-latest
 #            target: x86_64-pc-windows-msvc
 #            artifact_name: antdump.exe
