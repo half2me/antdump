@@ -3,7 +3,7 @@ use ant::messages::RxMessage;
 use antdump::collision::CollisionDetector;
 use antdump::message::{DeviceKey, serialize_broadcast};
 use antdump::tcp::TcpWriter;
-use antdump::usb::{BringUp, Dongle, INIT_ATTEMPTS, bring_up, list_dongles};
+use antdump::usb::{Dongle, INIT_ATTEMPTS, bring_up, list_dongles};
 use clap::Parser;
 use std::io;
 use std::time::Duration;
@@ -23,7 +23,13 @@ struct Args {
 
     /// Collision detection threshold in milliseconds. Messages arriving closer together
     /// than this are considered collisions and dropped. Set to 0 to disable.
-    #[arg(long, default_value_t = 1.0)]
+    ///
+    /// A venue capture puts the normal ANT+ cadence at the 200-300 ms channel
+    /// period and collisions under 1 ms, so anything in between separates them.
+    /// Erring high is the cheap direction: profiles carry cumulative counters, so
+    /// a legitimate message dropped here costs nothing, while a garbled one
+    /// admitted costs a wrong number nothing downstream can catch.
+    #[arg(long, default_value_t = 25.0)]
     collision_threshold_ms: f64,
 
     /// Only show warnings (collisions, dropped packets, errors). Suppress per-packet output.
@@ -56,12 +62,7 @@ fn init_driver(selector: Option<&str>) -> Dongle {
     let report =
         |attempt, err: &_| eprintln!("ERROR: {err} (attempt {attempt} of {INIT_ATTEMPTS})");
     match bring_up(INIT_ATTEMPTS, selector, report) {
-        Ok(BringUp { driver, lib_config }) => {
-            if let Some(warning) = lib_config.warning() {
-                eprintln!("WARNING: {warning}");
-            }
-            driver
-        }
+        Ok(driver) => driver,
         Err(err) => {
             // Exiting is the honest outcome: a supervisor can restart us, and a
             // restart now stands a chance because each attempt reset the device

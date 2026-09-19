@@ -18,7 +18,7 @@ use ant::drivers::Driver;
 use ant::messages::channel::MessageCode;
 use ant::messages::config::{
     AssignChannel, ChannelId, ChannelRfFrequency, ChannelType, DeviceType, EnableExtRxMessages,
-    LibConfig, SetNetworkKey, TransmissionType,
+    SetNetworkKey, TransmissionType,
 };
 use ant::messages::control::{OpenRxScanMode, RequestMessage, RequestableMessageId, ResetSystem};
 use ant::messages::requested_response::ChannelState;
@@ -70,46 +70,21 @@ impl fmt::Display for InitError {
     }
 }
 
-/// What became of the one optional step, for the caller to report.
-#[derive(Debug, PartialEq)]
-pub enum LibConfigOutcome {
-    Accepted,
-    /// A dongle that refuses it still works on the legacy extension, with
-    /// channel ids but no RX timestamps.
-    Rejected(MessageCode),
-    /// It answered everything else, so it is listening; it just said nothing
-    /// about this one.
-    Unanswered,
-}
-
-impl LibConfigOutcome {
-    /// What to tell the operator when the step did not land: one line naming
-    /// what was lost, or nothing when it was accepted.
-    pub fn warning(&self) -> Option<String> {
-        const LOST: &str =
-            "no RX timestamps, so collision detection falls back to wall-clock timing";
-        match self {
-            Self::Accepted => None,
-            Self::Rejected(code) => {
-                Some(format!("the dongle rejected LibConfig ({code:?}); {LOST}"))
-            }
-            Self::Unanswered => Some(format!("the dongle did not answer LibConfig; {LOST}")),
-        }
-    }
-}
-
 /// Configure channel 0 as a promiscuous ANT+ receiver, confirming every step.
 ///
-/// The order of the last two is load-bearing: `EnableExtRxMessages` is the
-/// legacy switch and turns on the channel id block only, `LibConfig` supersedes
-/// it and adds RX timestamps. Legacy first leaves a clone that ignores
-/// LibConfig still reporting channel ids.
+/// `EnableExtRxMessages` is the legacy switch and turns on the channel id block,
+/// which is the only extended data anything here reads. **`LibConfig` is
+/// deliberately not sent**, because the two things it adds are both unwanted:
 ///
-/// RSSI is deliberately NOT requested. Every stick on the bench reports the AGC
-/// register rather than dBm, and that register was measured byte-identical
-/// from point-blank to out of range, so the block would cost three or four
-/// bytes a frame and tell nobody anything.
-pub fn configure<E, D: Driver<E>>(driver: &mut D) -> Result<LibConfigOutcome, InitError> {
+/// - RSSI, because every stick on the bench reports the AGC register rather than
+///   dBm, and that register was measured byte-identical from point-blank to out
+///   of range, so the block would cost bytes a frame and tell nobody anything.
+/// - RX timestamps, because the collision detector times on the host's arrival
+///   clock instead. A stamp riding inside a frame can be garbled by the very
+///   fault the detector exists to catch, and it resolves a distinction nothing
+///   needs: a venue capture puts the normal cadence 200x away from the collision
+///   window, which an arrival clock separates comfortably.
+pub fn configure<E, D: Driver<E>>(driver: &mut D) -> Result<(), InitError> {
     reset(driver)?;
 
     confirm(
@@ -143,13 +118,11 @@ pub fn configure<E, D: Driver<E>>(driver: &mut D) -> Result<LibConfigOutcome, In
         &EnableExtRxMessages::new(true),
     )?;
 
-    let lib_config = lib_config(driver)?;
-
     // Scan mode answers with broadcast data rather than a response, so there is
     // nothing to confirm; everything it depends on is confirmed above.
     send(driver, "scan mode", &OpenRxScanMode::default())?;
 
-    Ok(lib_config)
+    Ok(())
 }
 
 /// Reset the dongle and wait for the startup notification it always answers
@@ -195,19 +168,6 @@ pub fn probe_channel<E, D: Driver<E>>(
     }
     Err(InitError::Deaf {
         message: "a channel status request",
-    })
-}
-
-/// LibConfig is the one step the channel does not depend on, so a refusal
-/// degrades rather than fails: the legacy switch above already carries channel
-/// ids, which is what the collision detector and the device registry need.
-fn lib_config<E, D: Driver<E>>(driver: &mut D) -> Result<LibConfigOutcome, InitError> {
-    // Channel id, no RSSI, RX timestamps.
-    send(driver, "LibConfig", &LibConfig::new(true, false, true))?;
-    Ok(match await_response(driver, TxMessageId::LibConfig) {
-        Some(MessageCode::ResponseNoError) => LibConfigOutcome::Accepted,
-        Some(code) => LibConfigOutcome::Rejected(code),
-        None => LibConfigOutcome::Unanswered,
     })
 }
 
@@ -273,8 +233,6 @@ mod tests {
         /// What a channel status request is answered with; `None` is silence.
         channel_state: Option<ChannelState>,
         sent: Vec<TxMessageId>,
-        /// The packed bytes of the LibConfig it was sent, if any.
-        lib_config: Option<Vec<u8>>,
         pending: Vec<AntMessage>,
     }
 
@@ -295,10 +253,8 @@ mod tests {
                         TxMessageId::EnableExtRxMessages,
                         MessageCode::ResponseNoError,
                     ),
-                    (TxMessageId::LibConfig, MessageCode::ResponseNoError),
                 ],
                 sent: Vec::new(),
-                lib_config: None,
                 pending: Vec::new(),
             }
         }
@@ -309,7 +265,6 @@ mod tests {
                 answers: Vec::new(),
                 channel_state: None,
                 sent: Vec::new(),
-                lib_config: None,
                 pending: Vec::new(),
             }
         }
@@ -349,11 +304,6 @@ mod tests {
         ) -> Result<(), DriverError<FakeError>> {
             let id = msg.get_tx_msg_id();
             self.sent.push(id);
-            if id == TxMessageId::LibConfig {
-                let mut buf = [0u8; 16];
-                let len = msg.serialize_message(&mut buf).expect("LibConfig packs");
-                self.lib_config = Some(buf[..len].to_vec());
-            }
             if id == TxMessageId::ResetSystem {
                 if self.answers_reset {
                     self.pending.push(startup());
@@ -452,18 +402,10 @@ mod tests {
         assert!(matches!(passed[0].message, RxMessage::BroadcastData(_)));
     }
 
-    // Byte 1 of LibConfig: channel id (0x80), RSSI (0x40), RX timestamp (0x20).
-    #[test]
-    fn lib_config_asks_for_channel_ids_and_timestamps_but_not_rssi() {
-        let mut dongle = FakeDongle::healthy();
-        configure(&mut dongle).unwrap();
-        assert_eq!(dongle.lib_config.as_deref(), Some(&[0x00, 0xA0][..]));
-    }
-
     #[test]
     fn a_healthy_dongle_is_configured_in_order() {
         let mut dongle = FakeDongle::healthy();
-        assert_eq!(configure(&mut dongle), Ok(LibConfigOutcome::Accepted));
+        assert_eq!(configure(&mut dongle), Ok(()));
         assert_eq!(
             dongle.sent,
             vec![
@@ -472,10 +414,9 @@ mod tests {
                 TxMessageId::AssignChannel,
                 TxMessageId::ChannelId,
                 TxMessageId::ChannelRfFrequency,
-                // The legacy switch before LibConfig, so a dongle that ignores
-                // LibConfig still reports channel ids.
+                // The legacy switch is what carries the channel ids; LibConfig
+                // is deliberately never sent.
                 TxMessageId::EnableExtRxMessages,
-                TxMessageId::LibConfig,
                 TxMessageId::OpenRxScanMode,
             ]
         );
@@ -518,25 +459,5 @@ mod tests {
                 code: MessageCode::InvalidMessage
             })
         );
-    }
-
-    // A dongle that refuses LibConfig keeps the legacy extension, so it is a
-    // degraded capture rather than a failure.
-    #[test]
-    fn a_refused_lib_config_still_opens_the_channel() {
-        let mut dongle =
-            FakeDongle::healthy().rejecting(TxMessageId::LibConfig, MessageCode::InvalidMessage);
-        assert_eq!(
-            configure(&mut dongle),
-            Ok(LibConfigOutcome::Rejected(MessageCode::InvalidMessage))
-        );
-        assert!(dongle.sent.contains(&TxMessageId::OpenRxScanMode));
-    }
-
-    #[test]
-    fn an_unanswered_lib_config_still_opens_the_channel() {
-        let mut dongle = FakeDongle::healthy().without(TxMessageId::LibConfig);
-        assert_eq!(configure(&mut dongle), Ok(LibConfigOutcome::Unanswered));
-        assert!(dongle.sent.contains(&TxMessageId::OpenRxScanMode));
     }
 }

@@ -29,15 +29,6 @@ impl DeviceKey {
     }
 }
 
-/// The dongle's own RX timestamp, in u16 ticks of its 32768 Hz clock. Absent
-/// unless `LibConfig` enabled it.
-pub fn rx_timestamp(msg: &AntMessage) -> Option<u16> {
-    match &msg.message {
-        RxMessage::BroadcastData(brd) => Some(brd.extended_info?.timestamp_output?.rx_timestamp),
-        _ => None,
-    }
-}
-
 impl fmt::Display for DeviceKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.device_number, self.device_type_id)
