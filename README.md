@@ -24,6 +24,11 @@ antsim --max --dongle 168 --start-id 65532     # fill one stick, leave the rest 
 antsim --reset                                 # silence dongles left transmitting
 ```
 
+**Every dongle is driven from one thread.** Threading them segfaulted on macOS — libusb is
+not reliably safe under concurrent synchronous transfers on a shared context — and it bought
+nothing: a round-robin poll has roughly a 15x margin over the rate the radios ask for
+payloads at.
+
 **Stopping it matters.** An ANT dongle is an autonomous radio: once a channel is open its
 firmware transmits on its own schedule and only asks the host for the next payload, so a
 process that dies without closing the channel leaves the stick broadcasting its last

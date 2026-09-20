@@ -210,6 +210,18 @@ no timer and no sleeping in the transmit loop — `UsbDriver::get_message` alrea
 to 1 ms on its bulk read, so it self-throttles. It also means the displayed packet counts
 are transmissions that actually happened rather than payloads handed over.
 
+**One thread drives every dongle, and that is not a simplification.** Giving each stick its
+own thread segfaulted on macOS within a second of the channels opening. The Rust side is
+sound — `rusb` marks `DeviceHandle` `Send`, and each thread owned its own driver — but two
+threads doing concurrent synchronous bulk transfers on the shared `GlobalContext` is not a
+path libusb is reliably safe on. `sim::pump` therefore serves at most one message and
+returns, and `antsim` takes turns across its sticks from one thread. The margin is
+comfortable rather than tight: `get_message` blocks at most 1 ms, so a cycle over N sticks
+costs about N ms, while a dongle with all eight channels open raises an `EVENT_TX` roughly
+every 31 ms — and a missed event costs nothing, since the radio repeats the payload and
+raises it again a period later. `sim::run` is the single-dongle loop over `pump`, kept for
+a caller that only has one.
+
 **An open master channel outlives the process that opened it, and this is the surprise
 that matters.** The dongle is an autonomous radio: once `OpenChannel` succeeds its firmware
 transmits at the channel period on its own and only asks the host for the *next* payload.

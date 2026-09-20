@@ -463,12 +463,65 @@ impl fmt::Display for SimError {
 
 impl std::error::Error for SimError {}
 
-/// Feed one dongle's open master channels until something breaks or `stop` is
-/// set, which returns `Ok` and leaves the caller to [`shut_down`] the stick.
+/// Serve at most one message from one dongle, and return.
+///
+/// **Single step on purpose.** A fleet spread over several sticks is driven by
+/// calling this on each in turn from ONE thread, rather than by giving each
+/// stick a thread of its own. Two threads doing concurrent synchronous bulk
+/// transfers on a shared libusb context segfaulted on macOS — the handles are
+/// `Send` and the Rust side is sound, but the C library underneath is not
+/// reliably safe on that path, and nothing here needs it to be.
+///
+/// Round-robin is comfortable rather than tight. `get_message` blocks at most
+/// 1 ms on its bulk read, so a cycle over N sticks costs about N ms, while a
+/// dongle with all eight channels open raises an `EVENT_TX` roughly every
+/// 31 ms. And a missed event costs nothing anyway: the radio repeats the
+/// payload and raises it again a period later.
 ///
 /// `sent[i]` counts transmissions on channel `i`. It is bumped on `EVENT_TX`,
 /// which the radio raises after a transmission has gone out, so the number is
 /// packets on the air rather than payloads offered.
+pub fn pump<E, D: Driver<E>>(
+    driver: &mut D,
+    devices: &[SimDevice],
+    start: Instant,
+    sent: &[AtomicU64],
+) -> Result<(), SimError> {
+    let msg = match driver.get_message() {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return Ok(()),
+        Err(_) => return Err(SimError::Driver),
+    };
+    let RxMessage::ChannelEvent(event) = msg.message else {
+        return Ok(());
+    };
+    let channel = event.payload.channel_number;
+    match event.payload.message_code {
+        MessageCode::EventTx => {
+            let Some(device) = devices.get(channel as usize) else {
+                return Ok(());
+            };
+            let page = device.page(start.elapsed());
+            if driver
+                .send_message(&BroadcastData::new(channel, page))
+                .is_err()
+            {
+                return Err(SimError::Write { channel });
+            }
+            if let Some(counter) = sent.get(channel as usize) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        MessageCode::EventChannelClosed => return Err(SimError::ChannelClosed { channel }),
+        _ => (),
+    }
+    Ok(())
+}
+
+/// Feed one dongle's open master channels until something breaks or `stop` is
+/// set, which returns `Ok` and leaves the caller to [`shut_down`] the stick.
+///
+/// For one dongle. A fleet across several is [`pump`]ed in turn instead.
 pub fn run<E, D: Driver<E>>(
     driver: &mut D,
     devices: &[SimDevice],
@@ -476,41 +529,10 @@ pub fn run<E, D: Driver<E>>(
     sent: &[AtomicU64],
     stop: &AtomicBool,
 ) -> Result<(), SimError> {
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let msg = match driver.get_message() {
-            Ok(Some(msg)) => msg,
-            Ok(None) => continue,
-            Err(_) => return Err(SimError::Driver),
-        };
-        let RxMessage::ChannelEvent(event) = msg.message else {
-            continue;
-        };
-        let channel = event.payload.channel_number;
-        match event.payload.message_code {
-            MessageCode::EventTx => {
-                let Some(device) = devices.get(channel as usize) else {
-                    continue;
-                };
-                let page = device.page(start.elapsed());
-                if driver
-                    .send_message(&BroadcastData::new(channel, page))
-                    .is_err()
-                {
-                    return Err(SimError::Write { channel });
-                }
-                if let Some(counter) = sent.get(channel as usize) {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            MessageCode::EventChannelClosed => {
-                return Err(SimError::ChannelClosed { channel });
-            }
-            _ => (),
-        }
+    while !stop.load(Ordering::Relaxed) {
+        pump(driver, devices, start, sent)?;
     }
+    Ok(())
 }
 
 /// Put a stick back the way it was found, and prove it took.
@@ -986,6 +1008,38 @@ mod tests {
         // Counted per channel, and only for transmissions that happened.
         assert_eq!(sent[0].load(Ordering::Relaxed), 1);
         assert_eq!(sent[1].load(Ordering::Relaxed), 1);
+    }
+
+    /// The round-robin's building block: one call serves at most one message
+    /// and comes back, so a caller with several sticks can take turns instead
+    /// of giving each one a thread — which is what segfaulted libusb on macOS.
+    #[test]
+    fn a_pump_serves_one_message_and_returns_rather_than_looping() {
+        let mut dongle = FakeDongle::new();
+        let devices = spec(2).build().unwrap();
+        let sent: Vec<AtomicU64> = (0..2).map(|_| AtomicU64::new(0)).collect();
+        dongle.pending.push(channel_event(0, MessageCode::EventTx));
+        dongle.pending.push(channel_event(1, MessageCode::EventTx));
+
+        let start = Instant::now();
+        assert_eq!(pump(&mut dongle, &devices, start, &sent), Ok(()));
+        assert_eq!(dongle.broadcasts().len(), 1, "one message, then back");
+
+        assert_eq!(pump(&mut dongle, &devices, start, &sent), Ok(()));
+        assert_eq!(dongle.broadcasts().len(), 2);
+
+        // Nothing waiting is not an error, and costs nothing.
+        assert_eq!(pump(&mut dongle, &devices, start, &sent), Ok(()));
+        assert_eq!(dongle.broadcasts().len(), 2);
+
+        // A failure still surfaces through it.
+        dongle
+            .pending
+            .push(channel_event(1, MessageCode::EventChannelClosed));
+        assert_eq!(
+            pump(&mut dongle, &devices, start, &sent),
+            Err(SimError::ChannelClosed { channel: 1 })
+        );
     }
 
     /// The bug this exists for: an open master channel belongs to the dongle,
