@@ -4,7 +4,10 @@
 //! of virtual sensors so the receiver can be checked against traffic whose
 //! every counter is known in advance.
 
-use antdump::sim::{CHANNELS_PER_DONGLE, FleetSpec, MasterOps, Profile, SimDevice, capacity, run};
+use antdump::sim::{
+    CHANNELS_PER_DONGLE, DeviceState, FleetSpec, MasterOps, Profile, SPEED_CADENCE_AND_POWER,
+    SPEED_CADENCE_ONLY, SimDevice, capacity, run,
+};
 use antdump::usb::{DongleId, INIT_ATTEMPTS, bring_up_with, list_dongles};
 use clap::Parser;
 use std::io::{IsTerminal, Write};
@@ -21,18 +24,40 @@ const REFRESH: Duration = Duration::from_millis(500);
 /// keeps fitting on a screen. The totals always cover every device.
 const MAX_ROWS: usize = 32;
 
+/// The span `--max-spread` fans the fleet across.
+///
+/// The speed endpoints are picked to straddle the profile's own 4.05 Hz
+/// broadcast rate rather than to be round numbers. On the default wheel, 5 km/h
+/// is about 0.66 wheel revolutions a second, so six broadcasts running carry an
+/// identical count and event time; 60 km/h is nearly 8 a second, so the count
+/// climbs by two between broadcasts. Those are the two regimes a receiver can
+/// get wrong, and this puts both on the air at once.
+///
+/// Cadence gets its own span because a crank does not speed up with the road:
+/// 40 to 120 rpm covers a plausible range and stays below the broadcast rate
+/// throughout, which is where real cadence always sits.
+const SPREAD_SLOWEST_KPH: f64 = 5.0;
+const SPREAD_FASTEST_KPH: f64 = 60.0;
+const SPREAD_SLOWEST_RPM: f64 = 40.0;
+const SPREAD_FASTEST_RPM: f64 = 120.0;
+const SPREAD_LOWEST_W: f64 = 50.0;
+const SPREAD_HIGHEST_W: f64 = 600.0;
+
 /// Simulate ANT+ bike sensors and transmit them on the air
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// How many devices to simulate. Each dongle carries 8, so a bigger fleet
-    /// uses more dongles; `--list-dongles` prints the ceiling. [default: 8]
+    /// How many bikes to simulate. Each bike takes one channel per sensor and
+    /// each dongle has 8, so a dongle carries 4 bikes with power or 8 with
+    /// `--no-power`; `--list-dongles` prints both ceilings.
+    /// [default: one dongle's worth]
     #[arg(long, short = 'n', conflicts_with = "max")]
     devices: Option<usize>,
 
-    /// Fill every dongle: simulate 8 devices on each one found, which is as
-    /// many as the hardware can carry. Respects `--dongle`, so naming one stick
-    /// fills that stick alone and leaves the others free to receive on.
+    /// Fill every dongle: as many bikes as the hardware can carry, which is 4
+    /// per stick with power or 8 with `--no-power`. Respects `--dongle`, so
+    /// naming one stick fills that stick alone and leaves the others free to
+    /// receive on.
     #[arg(long, conflicts_with = "devices")]
     max: bool,
 
@@ -42,11 +67,11 @@ struct Args {
     start_id: u32,
 
     /// Constant speed in km/h.
-    #[arg(long, default_value_t = 25.0)]
+    #[arg(long, default_value_t = 25.0, conflicts_with = "max_spread")]
     speed: f64,
 
     /// Constant cadence in rpm.
-    #[arg(long, default_value_t = 85.0)]
+    #[arg(long, default_value_t = 85.0, conflicts_with = "max_spread")]
     cadence: f64,
 
     /// Spread speeds across the fleet, in km/h: the last device rides this much
@@ -54,8 +79,27 @@ struct Args {
     /// cadence following the same ratio. Zero makes every device identical,
     /// which is simpler to read but cannot reveal a receiver that attributes
     /// one device's page to another.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.0, conflicts_with = "max_spread")]
     spread: f64,
+
+    /// Fan the fleet across the whole plausible range instead of a base speed
+    /// and an offset: 5 to 60 km/h, 40 to 120 rpm, 50 to 600 W. The speed
+    /// endpoints straddle
+    /// the profile's own broadcast rate, so the slow devices repeat a counter
+    /// for several broadcasts running while the fast ones advance it by two
+    /// between broadcasts, and both cases are on the air at once.
+    #[arg(long, conflicts_with_all = ["speed", "spread"])]
+    max_spread: bool,
+
+    /// Constant power in watts, on each bike's power channel.
+    #[arg(long, default_value_t = 200, conflicts_with = "max_spread")]
+    watts: u16,
+
+    /// Leave the power meter off, so each bike is speed and cadence alone.
+    /// That is one channel per bike instead of two, which fits twice as many
+    /// bikes on the same dongles: 8 per stick rather than 4.
+    #[arg(long)]
+    no_power: bool,
 
     /// Wheel circumference in metres. The default is a 700x23c.
     #[arg(long, default_value_t = 2.096)]
@@ -66,7 +110,7 @@ struct Args {
     #[arg(long)]
     dongle: Option<String>,
 
-    /// Print every ANT+ dongle on the bus and how many devices they can carry,
+    /// Print every ANT+ dongle on the bus and how many bikes they can carry,
     /// then exit.
     #[arg(long)]
     list_dongles: bool,
@@ -91,13 +135,22 @@ fn main() -> io::Result<()> {
     }
 
     let dongles = usable_dongles(args.dongle.as_deref())?;
+    let profiles = if args.no_power {
+        SPEED_CADENCE_ONLY
+    } else {
+        SPEED_CADENCE_AND_POWER
+    };
+    let spans = Spans::of(&args);
     let spec = FleetSpec {
-        devices: fleet_size(args.max, args.devices, &dongles),
+        devices: fleet_size(args.max, args.devices, &dongles, profiles.len()),
         start_id: args.start_id,
-        profile: Profile::SpeedAndCadence,
-        speed_kph: args.speed,
-        cadence_rpm: args.cadence,
-        spread_kph: args.spread,
+        profiles,
+        speed_kph: spans.speed,
+        cadence_rpm: spans.cadence,
+        power_watts: spans.watts,
+        spread_kph: spans.speed_span,
+        cadence_spread_rpm: spans.cadence_span,
+        power_spread_w: spans.watts_span,
         wheel_circumference_m: args.wheel,
     };
 
@@ -144,12 +197,17 @@ fn print_dongles() -> io::Result<()> {
     for dongle in &dongles {
         println!("{dongle}");
     }
+    let channels = capacity(&dongles);
     println!();
     println!(
-        "{} dongle(s) x {CHANNELS_PER_DONGLE} channels = {} simulated devices maximum.",
-        dongles.len(),
-        capacity(&dongles)
+        "{} dongle(s) x {CHANNELS_PER_DONGLE} channels = {channels} channels.",
+        dongles.len()
     );
+    println!(
+        "  {} bikes with speed&cadence + power (2 channels each)",
+        channels / SPEED_CADENCE_AND_POWER.len()
+    );
+    println!("  {channels} bikes with speed&cadence only (--no-power, 1 channel each)");
     println!(
         "{CHANNELS_PER_DONGLE} is the radio's limit, not a setting: these sticks are eight-channel parts."
     );
@@ -165,13 +223,67 @@ fn print_dongles() -> io::Result<()> {
     Ok(())
 }
 
-/// How many devices to simulate: as many as the hardware carries under
-/// `--max`, otherwise what was asked for, otherwise one dongle's worth.
-fn fleet_size(max: bool, devices: Option<usize>, dongles: &[DongleId]) -> usize {
+/// Where each quantity starts and how far it fans across the fleet.
+struct Spans {
+    speed: f64,
+    speed_span: f64,
+    cadence: f64,
+    cadence_span: f64,
+    watts: f64,
+    watts_span: f64,
+}
+
+impl Spans {
+    /// Outside `--max-spread`, cadence and power keep the proportional
+    /// behaviour that reads naturally over a few km/h: a bike rolling 20%
+    /// faster also pedals and pushes 20% harder. That scaling lives here rather
+    /// than in `FleetSpec` because it is a choice about what looks right and
+    /// not about how a fleet is built — and it is exactly the choice
+    /// `--max-spread` has to make differently, since following the speed ratio
+    /// from 5 to 60 km/h would ask for 1020 rpm and 2400 W.
+    fn of(args: &Args) -> Self {
+        if args.max_spread {
+            return Self {
+                speed: SPREAD_SLOWEST_KPH,
+                speed_span: SPREAD_FASTEST_KPH - SPREAD_SLOWEST_KPH,
+                cadence: SPREAD_SLOWEST_RPM,
+                cadence_span: SPREAD_FASTEST_RPM - SPREAD_SLOWEST_RPM,
+                watts: SPREAD_LOWEST_W,
+                watts_span: SPREAD_HIGHEST_W - SPREAD_LOWEST_W,
+            };
+        }
+        let ratio = if args.speed > 0.0 {
+            args.spread / args.speed
+        } else {
+            0.0
+        };
+        Self {
+            speed: args.speed,
+            speed_span: args.spread,
+            cadence: args.cadence,
+            cadence_span: args.cadence * ratio,
+            watts: f64::from(args.watts),
+            watts_span: f64::from(args.watts) * ratio,
+        }
+    }
+}
+
+/// How many bikes to simulate: as many as the hardware carries under `--max`,
+/// otherwise what was asked for, otherwise one dongle's worth.
+///
+/// `--max` divides by the channels each bike needs, so turning the power meter
+/// on halves the answer rather than asking for a fleet that cannot fit.
+fn fleet_size(
+    max: bool,
+    devices: Option<usize>,
+    dongles: &[DongleId],
+    channels_per_device: usize,
+) -> usize {
+    let per_dongle = CHANNELS_PER_DONGLE / channels_per_device.max(1);
     if max {
-        capacity(dongles)
+        capacity(dongles) / channels_per_device.max(1)
     } else {
-        devices.unwrap_or(CHANNELS_PER_DONGLE)
+        devices.unwrap_or(per_dongle)
     }
 }
 
@@ -290,10 +402,10 @@ fn roster(assignments: &[Assignment]) -> String {
         out.push_str(&format!("{}\n", assignment.id));
         for (channel, device) in assignment.devices.iter().enumerate() {
             out.push_str(&format!(
-                "  ch{channel} {:>11}  {:>6.1} kph  {:>5.1} rpm\n",
+                "  ch{channel} {:>11}  {:<13}  {}\n",
                 key(device),
-                device.speed_kph,
-                device.cadence_rpm
+                device.profile.to_string(),
+                riding(device)
             ));
         }
     }
@@ -304,19 +416,26 @@ fn roster(assignments: &[Assignment]) -> String {
 fn frame(assignments: &[Assignment], elapsed: Duration) -> String {
     let devices: usize = assignments.iter().map(|a| a.devices.len()).sum();
     let sent = total_sent(assignments);
-    let profile = assignments
-        .first()
-        .and_then(|a| a.devices.first())
-        .map_or(Profile::SpeedAndCadence, |d| d.profile);
-    // What the radios should be managing between them. A measured rate below
-    // this is the fleet losing transmissions, which is worth seeing at a glance.
-    let expected = devices as f64 * profile.hz();
+    // What the radios should be managing between them, summed over every
+    // channel because the two profiles broadcast at slightly different rates.
+    // A measured rate below this is the fleet losing transmissions, which is
+    // worth seeing at a glance.
+    let expected: f64 = assignments
+        .iter()
+        .flat_map(|a| a.devices.iter())
+        .map(|d| d.profile.hz())
+        .sum();
+    let bikes = assignments
+        .iter()
+        .flat_map(|a| a.devices.iter())
+        .map(|d| d.device_number)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
 
     let mut out = String::new();
     out.push_str(&format!(
-        "antsim  {devices} device(s)  {} dongle(s)  {profile}  {:.2} Hz each\n",
+        "antsim  {bikes} bike(s)  {devices} channel(s)  {} dongle(s)\n",
         assignments.len(),
-        profile.hz()
     ));
     out.push_str(&format!(
         "up {}   sent {}   {:.1} pkt/s   expected {expected:.1} pkt/s\n\n",
@@ -325,8 +444,8 @@ fn frame(assignments: &[Assignment], elapsed: Duration) -> String {
         rate(sent, elapsed),
     ));
     out.push_str(&format!(
-        "  {:<12} {:<12} {:>2}  {:>8} {:>9} {:>8} {:>8} {:>10}\n",
-        "KEY", "DONGLE", "CH", "SPEED", "CADENCE", "S.REV", "C.REV", "SENT"
+        "  {:<12} {:<8} {:>2}  {:<14} {:<18} {:<24} {:>10}\n",
+        "KEY", "DONGLE", "CH", "PROFILE", "RIDING", "COUNTERS", "SENT"
     ));
 
     let mut rows = 0;
@@ -334,18 +453,18 @@ fn frame(assignments: &[Assignment], elapsed: Duration) -> String {
         for (channel, device) in assignment.devices.iter().enumerate() {
             if rows == MAX_ROWS {
                 out.push_str(&format!(
-                    "  ... and {} more device(s); the totals above cover them all\n",
+                    "  ... and {} more channel(s); the totals above cover them all\n",
                     devices - rows
                 ));
                 return out;
             }
-            let (wheel, crank) = device.revolutions(elapsed);
             out.push_str(&format!(
-                "  {:<12} {:<12} {channel:>2}  {:>6.1}kph {:>6.1}rpm {wheel:>8} {crank:>8} {:>10}\n",
+                "  {:<12} {:<8} {channel:>2}  {:<14} {:<18} {:<24} {:>10}\n",
                 key(device),
                 assignment.id.port,
-                device.speed_kph,
-                device.cadence_rpm,
+                device.profile.to_string(),
+                riding(device),
+                counters(device, elapsed),
                 commas(assignment.sent[channel].load(Ordering::Relaxed)),
             ));
             rows += 1;
@@ -358,6 +477,34 @@ fn frame(assignments: &[Assignment], elapsed: Duration) -> String {
 /// front of every packet, so the two outputs line up by eye and by `grep`.
 fn key(device: &SimDevice) -> String {
     format!("{}:{}", device.device_number, device.profile.device_type())
+}
+
+/// What the bike is doing, in the terms its own profile transmits: a speed and
+/// cadence sensor knows nothing about watts, and a power meter knows nothing
+/// about road speed.
+fn riding(device: &SimDevice) -> String {
+    match device.profile {
+        Profile::SpeedAndCadence => {
+            format!("{:.1}kph {:.0}rpm", device.speed_kph, device.cadence_rpm)
+        }
+        Profile::Power => format!("{}W {:.0}rpm", device.power_watts, device.cadence_rpm),
+    }
+}
+
+/// The counters as they went on the air. These are what `antdump` has to get
+/// right, so they are shown as the numbers in the payload rather than as the
+/// speed or power a receiver would derive from them.
+fn counters(device: &SimDevice, elapsed: Duration) -> String {
+    match device.state(elapsed) {
+        DeviceState::SpeedAndCadence {
+            wheel_revs,
+            crank_revs,
+        } => format!("s.rev {wheel_revs}  c.rev {crank_revs}"),
+        DeviceState::Power {
+            events,
+            accumulated,
+        } => format!("events {events}  acc {}", commas(u64::from(accumulated))),
+    }
 }
 
 fn total_sent(assignments: &[Assignment]) -> u64 {
@@ -422,7 +569,7 @@ mod tests {
     /// shape is not cosmetic.
     #[test]
     fn the_key_matches_the_one_antdump_prints() {
-        let device = SimDevice::new(70_000, Profile::SpeedAndCadence, 25.0, 85.0, 2.096);
+        let device = SimDevice::new(70_000, Profile::SpeedAndCadence, 25.0, 85.0, 200, 2.096);
         assert_eq!(key(&device), "70000:121");
     }
 
@@ -432,10 +579,13 @@ mod tests {
         let fleet = FleetSpec {
             devices: dongles * per_dongle,
             start_id: 65_533,
-            profile: Profile::SpeedAndCadence,
+            profiles: SPEED_CADENCE_ONLY,
             speed_kph: 25.0,
             cadence_rpm: 85.0,
+            power_watts: 200.0,
             spread_kph: 10.0,
+            cadence_spread_rpm: 20.0,
+            power_spread_w: 0.0,
             wheel_circumference_m: 2.096,
         }
         .build()
@@ -466,7 +616,10 @@ mod tests {
         let assignments = assignments(2, 3);
         let frame = frame(&assignments, Duration::from_secs(83));
 
-        assert!(frame.contains("6 device(s)  2 dongle(s)"), "{frame}");
+        assert!(
+            frame.contains("6 bike(s)  6 channel(s)  2 dongle(s)"),
+            "{frame}"
+        );
         assert!(frame.contains("up 00:01:23"), "{frame}");
         // 6 devices at 4.05 Hz is what the radios should be managing.
         assert!(frame.contains("expected 24.3 pkt/s"), "{frame}");
@@ -488,12 +641,59 @@ mod tests {
     fn an_oversized_fleet_is_truncated_with_a_note_rather_than_scrolling_away() {
         let assignments = assignments(6, 8);
         let frame = frame(&assignments, Duration::from_secs(10));
-        assert!(frame.contains("48 device(s)"), "{frame}");
-        assert!(frame.contains("... and 16 more device(s)"), "{frame}");
+        assert!(frame.contains("48 bike(s)  48 channel(s)"), "{frame}");
+        assert!(frame.contains("... and 16 more channel(s)"), "{frame}");
         assert_eq!(
             frame.lines().filter(|l| l.contains(":121")).count(),
             MAX_ROWS
         );
+    }
+
+    /// With the power meter on, a bike is two rows sharing one device number
+    /// and differing only by type — which is the arrangement that makes
+    /// `DeviceKey`'s type field matter.
+    #[test]
+    fn a_bike_with_power_shows_as_two_channels_under_one_device_number() {
+        let fleet = FleetSpec {
+            devices: 2,
+            start_id: 5000,
+            profiles: SPEED_CADENCE_AND_POWER,
+            speed_kph: 25.0,
+            cadence_rpm: 85.0,
+            power_watts: 200.0,
+            spread_kph: 0.0,
+            cadence_spread_rpm: 0.0,
+            power_spread_w: 0.0,
+            wheel_circumference_m: 2.096,
+        }
+        .build()
+        .unwrap();
+
+        // Two bikes, four channels, and each bike's pair adjacent so a chunk of
+        // eight never splits one across two sticks.
+        assert_eq!(fleet.len(), 4);
+        assert_eq!(
+            fleet.iter().map(key).collect::<Vec<_>>(),
+            ["5000:121", "5000:11", "5001:121", "5001:11"]
+        );
+
+        let assignment = Assignment {
+            id: DongleId {
+                port: "1-1.2".to_owned(),
+                serial: Some("134".to_owned()),
+            },
+            sent: Arc::new((0..4).map(|_| AtomicU64::new(7)).collect()),
+            devices: fleet,
+        };
+        let frame = frame(&[assignment], Duration::from_secs(60));
+        assert!(frame.contains("2 bike(s)  4 channel(s)"), "{frame}");
+        // Each profile is shown in the terms it actually transmits.
+        assert!(frame.contains("25.0kph 85rpm"), "{frame}");
+        assert!(frame.contains("200W 85rpm"), "{frame}");
+        assert!(frame.contains("s.rev "), "{frame}");
+        assert!(frame.contains("events "), "{frame}");
+        // 2 channels at 4.053 Hz plus 2 at 4.005 Hz.
+        assert!(frame.contains("expected 16.1 pkt/s"), "{frame}");
     }
 
     #[test]
@@ -508,14 +708,21 @@ mod tests {
                 serial: Some("168".to_owned()),
             },
         ];
-        assert_eq!(fleet_size(true, None, &two), 16);
-        assert_eq!(fleet_size(false, Some(3), &two), 3);
+        assert_eq!(fleet_size(true, None, &two, 1), 16);
+        assert_eq!(fleet_size(false, Some(3), &two, 1), 3);
         // No flag and no count is one dongle's worth, whatever is plugged in,
         // so the default leaves the other sticks free to receive on.
-        assert_eq!(fleet_size(false, None, &two), 8);
-        assert_eq!(fleet_size(false, None, &two[..1]), 8);
+        assert_eq!(fleet_size(false, None, &two, 1), 8);
+        assert_eq!(fleet_size(false, None, &two[..1], 1), 8);
         // `--max` with a single stick selected fills that stick alone.
-        assert_eq!(fleet_size(true, None, &two[..1]), 8);
+        assert_eq!(fleet_size(true, None, &two[..1], 1), 8);
+
+        // With the power meter on, a bike costs two channels, so the same
+        // hardware carries half as many and --max says so rather than asking
+        // for a fleet that cannot fit.
+        assert_eq!(fleet_size(true, None, &two, 2), 8);
+        assert_eq!(fleet_size(true, None, &two[..1], 2), 4);
+        assert_eq!(fleet_size(false, None, &two, 2), 4);
     }
 
     #[test]

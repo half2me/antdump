@@ -28,7 +28,10 @@
 //! happened rather than of payloads handed over.
 
 use crate::init::{InitError, NETWORK_KEY, RF_FREQ, confirm, reset, send};
-use crate::profile::{CSC_CHANNEL_PERIOD, CSC_DEVICE_TYPE, Revolutions, csc_page};
+use crate::profile::{
+    CSC_CHANNEL_PERIOD, CSC_DEVICE_TYPE, POWER_CHANNEL_PERIOD, POWER_DEVICE_TYPE, RevolutionState,
+    Revolutions, csc_page, power_page,
+};
 use crate::usb::{BringUpError, BringUpOps, Dongle, DongleId, open_dongle, reset_dongle};
 use ant::drivers::Driver;
 use ant::messages::RxMessage;
@@ -55,24 +58,33 @@ pub const MIN_DEVICE_NUMBER: u32 = 1;
 /// transmission type's extension nibble.
 pub const MAX_DEVICE_NUMBER: u32 = 0xF_FFFF;
 
-/// Which ANT+ profile a simulated device pretends to be.
+/// Which ANT+ profile a simulated channel pretends to be.
 ///
-/// Only the combined speed and cadence sensor exists so far. Power (type 11,
-/// period 8182) and fitness equipment (type 17, period 8192) join here, and the
-/// only other thing either needs is its own page builder in
-/// [`crate::profile`].
+/// Fitness equipment (type 17, period 8192) joins here, and the only other
+/// thing it needs is its own page builder in [`crate::profile`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Profile {
     /// Combined bike speed and cadence.
     #[default]
     SpeedAndCadence,
+    /// Bicycle power.
+    Power,
 }
+
+/// A bike carrying both sensors, which is what a real one with a power meter
+/// looks like on the air: two separate profiles, two separate channels, two
+/// different channel periods.
+pub const SPEED_CADENCE_AND_POWER: &[Profile] = &[Profile::SpeedAndCadence, Profile::Power];
+
+/// Speed and cadence alone, which fits twice as many bikes on a stick.
+pub const SPEED_CADENCE_ONLY: &[Profile] = &[Profile::SpeedAndCadence];
 
 impl Profile {
     #[must_use]
     pub fn device_type(self) -> u8 {
         match self {
             Self::SpeedAndCadence => CSC_DEVICE_TYPE,
+            Self::Power => POWER_DEVICE_TYPE,
         }
     }
 
@@ -80,6 +92,7 @@ impl Profile {
     pub fn channel_period(self) -> u16 {
         match self {
             Self::SpeedAndCadence => CSC_CHANNEL_PERIOD,
+            Self::Power => POWER_CHANNEL_PERIOD,
         }
     }
 
@@ -94,8 +107,18 @@ impl fmt::Display for Profile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SpeedAndCadence => write!(f, "speed&cadence"),
+            Self::Power => write!(f, "power"),
         }
     }
+}
+
+/// What a device's counters read at some moment, for the status display.
+/// Structured rather than formatted, because how it is laid out on a screen is
+/// the display's business and which counters exist is the profile's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceState {
+    SpeedAndCadence { wheel_revs: u16, crank_revs: u16 },
+    Power { events: u8, accumulated: u16 },
 }
 
 /// One virtual bike.
@@ -106,6 +129,7 @@ pub struct SimDevice {
     pub profile: Profile,
     pub speed_kph: f64,
     pub cadence_rpm: f64,
+    pub power_watts: u16,
     wheel: Revolutions,
     crank: Revolutions,
 }
@@ -117,6 +141,7 @@ impl SimDevice {
         profile: Profile,
         speed_kph: f64,
         cadence_rpm: f64,
+        power_watts: u16,
         wheel_circumference_m: f64,
     ) -> Self {
         Self {
@@ -124,6 +149,7 @@ impl SimDevice {
             profile,
             speed_kph,
             cadence_rpm,
+            power_watts,
             wheel: Revolutions::from_speed(speed_kph, wheel_circumference_m),
             crank: Revolutions::from_rpm(cadence_rpm),
         }
@@ -134,16 +160,30 @@ impl SimDevice {
     pub fn page(&self, elapsed: Duration) -> [u8; 8] {
         match self.profile {
             Profile::SpeedAndCadence => csc_page(self.crank.at(elapsed), self.wheel.at(elapsed)),
+            Profile::Power => {
+                power_page(self.crank.at(elapsed), self.power_watts, self.cadence_rpm)
+            }
         }
     }
 
-    /// The cumulative revolution counts, for the status display.
+    /// What its counters read at `elapsed`, for the status display.
+    ///
+    /// Both profiles are driven off the same crank, so a bike's power events
+    /// and its cadence revolutions are the same number and can be read against
+    /// each other: they are the one counter this simulator advances twice.
     #[must_use]
-    pub fn revolutions(&self, elapsed: Duration) -> (u16, u16) {
-        (
-            self.wheel.at(elapsed).revolutions,
-            self.crank.at(elapsed).revolutions,
-        )
+    pub fn state(&self, elapsed: Duration) -> DeviceState {
+        let crank = self.crank.at(elapsed);
+        match self.profile {
+            Profile::SpeedAndCadence => DeviceState::SpeedAndCadence {
+                wheel_revs: self.wheel.at(elapsed).revolutions,
+                crank_revs: crank.revolutions,
+            },
+            Profile::Power => DeviceState::Power {
+                events: (crank.revolutions % 256) as u8,
+                accumulated: accumulated_power(crank, self.power_watts),
+            },
+        }
     }
 
     /// The channel id that puts this device on the air under its own number.
@@ -168,23 +208,45 @@ impl SimDevice {
     }
 }
 
+/// The accumulator the power page carries, recomputed here so the display can
+/// show the same number that went on the air.
+fn accumulated_power(crank: RevolutionState, watts: u16) -> u16 {
+    (u64::from(watts) * u64::from(crank.revolutions) % (1 << 16)) as u16
+}
+
 /// What to simulate, before it is turned into devices.
 #[derive(Clone, Copy, Debug)]
 pub struct FleetSpec {
+    /// How many bikes, not how many channels. Each one occupies a channel per
+    /// profile in [`Self::profiles`], so turning power on halves how many fit
+    /// on a stick.
     pub devices: usize,
     pub start_id: u32,
-    pub profile: Profile,
+    /// Which sensors each bike carries. All of them share the bike's device
+    /// number and differ by device type, which is exactly how a real bike with
+    /// a power meter appears and what makes `DeviceKey`'s type field earn its
+    /// keep: keyed on the number alone, a bike's two streams would arrive
+    /// interleaved at ~4 Hz each and false-collide continuously.
+    pub profiles: &'static [Profile],
     pub speed_kph: f64,
     pub cadence_rpm: f64,
     /// How far the fastest device is above the slowest, in km/h. Zero makes
     /// every device identical.
     pub spread_kph: f64,
+    /// The same for cadence, and deliberately independent of `spread_kph`
+    /// rather than scaled from it. Scaling looks right over a few km/h and
+    /// falls apart over a wide span: a fleet fanned from 5 to 60 km/h with
+    /// cadence following the speed ratio would put its fast end at 1020 rpm.
+    /// The caller decides what the two spans are; this only walks them.
+    pub cadence_spread_rpm: f64,
+    pub power_watts: f64,
+    pub power_spread_w: f64,
     pub wheel_circumference_m: f64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FleetError {
-    /// A fleet of nothing.
+    /// A fleet of nothing, or of bikes carrying no sensors.
     Empty,
     /// Device number 0 is ANT's wildcard and cannot be transmitted.
     WildcardDeviceNumber,
@@ -201,7 +263,10 @@ pub enum FleetError {
 impl fmt::Display for FleetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Empty => write!(f, "a fleet needs at least one device"),
+            Self::Empty => write!(
+                f,
+                "a fleet needs at least one device carrying at least one sensor"
+            ),
             Self::WildcardDeviceNumber => write!(
                 f,
                 "device number 0 is the ANT wildcard and cannot be transmitted; start at {MIN_DEVICE_NUMBER} or above"
@@ -231,12 +296,13 @@ impl std::error::Error for FleetError {}
 impl FleetSpec {
     /// Turn the spec into devices, numbered upwards from `start_id`.
     ///
-    /// Speeds are spread linearly across the fleet so that no two devices
-    /// advance their counters at the same rate. That is not cosmetic: with an
-    /// identical fleet, a receiver that attributed one device's page to another
-    /// would produce output indistinguishable from correct.
+    /// Speed and cadence are each spread linearly across the fleet so that no
+    /// two devices advance their counters at the same rate. That is not
+    /// cosmetic: with an identical fleet, a receiver that attributed one
+    /// device's page to another would produce output indistinguishable from
+    /// correct.
     pub fn build(&self) -> Result<Vec<SimDevice>, FleetError> {
-        if self.devices == 0 {
+        if self.devices == 0 || self.profiles.is_empty() {
             return Err(FleetError::Empty);
         }
         if self.start_id < MIN_DEVICE_NUMBER {
@@ -249,30 +315,37 @@ impl FleetSpec {
 
         let span = (self.devices - 1).max(1) as f64;
         Ok((0..self.devices)
-            .map(|i| {
+            .flat_map(|i| {
                 let fraction = if self.devices <= 1 {
                     0.0
                 } else {
                     i as f64 / span
                 };
                 let speed = self.speed_kph + self.spread_kph * fraction;
-                // Cadence follows the same ratio, so a device that rolls faster
-                // also pedals faster and both of its counters stay telling
-                // apart from its neighbours'.
-                let cadence = if self.speed_kph > 0.0 {
-                    self.cadence_rpm * speed / self.speed_kph
-                } else {
-                    self.cadence_rpm
-                };
-                SimDevice::new(
-                    self.start_id + i as u32,
-                    self.profile,
-                    speed,
-                    cadence,
-                    self.wheel_circumference_m,
-                )
+                let cadence = self.cadence_rpm + self.cadence_spread_rpm * fraction;
+                let watts = (self.power_watts + self.power_spread_w * fraction)
+                    .round()
+                    .clamp(0.0, f64::from(u16::MAX)) as u16;
+                // A bike's sensors go out adjacent, so a chunk of eight keeps
+                // whole bikes on one stick rather than splitting one across two.
+                self.profiles.iter().map(move |&profile| {
+                    SimDevice::new(
+                        self.start_id + i as u32,
+                        profile,
+                        speed,
+                        cadence,
+                        watts,
+                        self.wheel_circumference_m,
+                    )
+                })
             })
             .collect())
+    }
+
+    /// How many channels one bike occupies.
+    #[must_use]
+    pub fn channels_per_device(&self) -> usize {
+        self.profiles.len().max(1)
     }
 
     /// Split a built fleet across the dongles it will run on, eight at a time.
@@ -612,10 +685,13 @@ mod tests {
         FleetSpec {
             devices,
             start_id: 1,
-            profile: Profile::SpeedAndCadence,
+            profiles: SPEED_CADENCE_ONLY,
             speed_kph: 25.0,
             cadence_rpm: 85.0,
+            power_watts: 200.0,
             spread_kph: 0.0,
+            cadence_spread_rpm: 0.0,
+            power_spread_w: 0.0,
             wheel_circumference_m: 2.096,
         }
     }
@@ -644,27 +720,35 @@ mod tests {
 
         let fanned = FleetSpec {
             spread_kph: 10.0,
+            cadence_spread_rpm: 20.0,
             ..spec(5)
         }
         .build()
         .unwrap();
         let speeds: Vec<f64> = fanned.iter().map(|d| d.speed_kph).collect();
         assert_eq!(speeds, [25.0, 27.5, 30.0, 32.5, 35.0]);
-        // Cadence keeps the same ratio, so both counters stay distinguishable.
-        assert!((fanned[4].cadence_rpm - 85.0 * 35.0 / 25.0).abs() < 1e-9);
+        // Cadence walks its own span, so a wide speed fan cannot drag it
+        // somewhere no crank turns.
+        assert_eq!(
+            fanned.iter().map(|d| d.cadence_rpm).collect::<Vec<_>>(),
+            [85.0, 90.0, 95.0, 100.0, 105.0]
+        );
         // Every device advances at its own rate, which is the whole point.
         let mut sorted = speeds.clone();
         sorted.dedup();
         assert_eq!(sorted.len(), speeds.len());
 
-        // A lone device sits at the base speed rather than dividing by zero.
+        // A lone device sits at the base of both spans rather than dividing by
+        // the zero-width fraction.
         let single = FleetSpec {
             spread_kph: 10.0,
+            cadence_spread_rpm: 20.0,
             ..spec(1)
         }
         .build()
         .unwrap();
         assert_eq!(single[0].speed_kph, 25.0);
+        assert_eq!(single[0].cadence_rpm, 85.0);
     }
 
     #[test]
@@ -724,7 +808,7 @@ mod tests {
     /// a number nobody asked for.
     #[test]
     fn a_device_number_above_65535_rides_in_the_transmission_type_extension() {
-        let device = SimDevice::new(70_000, Profile::SpeedAndCadence, 25.0, 85.0, 2.096);
+        let device = SimDevice::new(70_000, Profile::SpeedAndCadence, 25.0, 85.0, 200, 2.096);
         let id = device.channel_id(3);
         assert_eq!(id.channel_number, 3);
         assert_eq!(id.device_number, 0x1170);
@@ -743,7 +827,7 @@ mod tests {
         assert_eq!(u32::from(id.device_number) | extension, 70_000);
 
         // A number that fits in 16 bits leaves the nibble alone.
-        let small = SimDevice::new(1234, Profile::SpeedAndCadence, 25.0, 85.0, 2.096);
+        let small = SimDevice::new(1234, Profile::SpeedAndCadence, 25.0, 85.0, 200, 2.096);
         assert_eq!(
             small
                 .channel_id(0)
@@ -832,8 +916,8 @@ mod tests {
     fn each_event_is_answered_with_that_channels_own_device() {
         let mut dongle = FakeDongle::new();
         let devices = vec![
-            SimDevice::new(1, Profile::SpeedAndCadence, 0.0, 0.0, 2.096),
-            SimDevice::new(2, Profile::SpeedAndCadence, 25.0, 85.0, 2.096),
+            SimDevice::new(1, Profile::SpeedAndCadence, 0.0, 0.0, 0, 2.096),
+            SimDevice::new(2, Profile::SpeedAndCadence, 25.0, 85.0, 200, 2.096),
         ];
         let sent: Vec<AtomicU64> = (0..2).map(|_| AtomicU64::new(0)).collect();
 
@@ -894,6 +978,72 @@ mod tests {
             SimError::ChannelClosed { channel: 0 }
         );
         assert!(dongle.broadcasts().is_empty());
+    }
+
+    /// A bike's two channels carry two different profiles at two different
+    /// periods, and each must get its own page: swapping them would put a
+    /// power page on the speed channel, which parses as a plausible bicycle.
+    #[test]
+    fn a_bikes_two_channels_carry_their_own_profiles_pages_and_periods() {
+        let fleet = FleetSpec {
+            profiles: SPEED_CADENCE_AND_POWER,
+            ..spec(1)
+        }
+        .build()
+        .unwrap();
+        assert_eq!(fleet.len(), 2);
+
+        let (csc, power) = (fleet[0], fleet[1]);
+        assert_eq!(csc.profile, Profile::SpeedAndCadence);
+        assert_eq!(power.profile, Profile::Power);
+        // One bike, one number; the device type is what tells them apart.
+        assert_eq!(csc.device_number, power.device_number);
+        assert_eq!(
+            csc.channel_id(0).device_type.device_type_id.to_primitive(),
+            121
+        );
+        assert_eq!(
+            power
+                .channel_id(1)
+                .device_type
+                .device_type_id
+                .to_primitive(),
+            11
+        );
+        assert_eq!(csc.profile.channel_period(), CSC_CHANNEL_PERIOD);
+        assert_eq!(power.profile.channel_period(), POWER_CHANNEL_PERIOD);
+
+        // The power page announces itself; the combined page has no page byte
+        // at all, so its first byte is a timestamp and not 0x10.
+        let elapsed = Duration::from_secs(30);
+        assert_eq!(power.page(elapsed)[0], 0x10);
+        assert_eq!(
+            u16::from_le_bytes([power.page(elapsed)[6], power.page(elapsed)[7]]),
+            200,
+            "instantaneous watts"
+        );
+
+        // Both are driven off the same crank, so the power event count and the
+        // combined page's cadence revolutions are the same number.
+        let DeviceState::SpeedAndCadence { crank_revs, .. } = csc.state(elapsed) else {
+            panic!("speed and cadence device reported power state");
+        };
+        let DeviceState::Power { events, .. } = power.state(elapsed) else {
+            panic!("power device reported speed and cadence state");
+        };
+        assert_eq!(u16::from(events), crank_revs % 256);
+    }
+
+    #[test]
+    fn a_fleet_of_bikes_with_no_sensors_is_refused() {
+        assert_eq!(
+            FleetSpec {
+                profiles: &[],
+                ..spec(4)
+            }
+            .build(),
+            Err(FleetError::Empty)
+        );
     }
 
     #[test]

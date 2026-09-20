@@ -27,6 +27,22 @@ use std::time::Duration;
 pub const CSC_DEVICE_TYPE: u8 = 121;
 pub const CSC_CHANNEL_PERIOD: u16 = 8086;
 
+/// Bicycle power, page 0x10 (standard power-only). The period is 4.004 Hz, and
+/// it is the other of the two the bench capture measured (8182 ticks).
+pub const POWER_DEVICE_TYPE: u8 = 11;
+pub const POWER_CHANNEL_PERIOD: u16 = 8182;
+
+/// The only page the power profile needs: instantaneous watts plus the
+/// accumulator a receiver differentiates to get average power.
+const POWER_PAGE: u8 = 0x10;
+
+/// What an ANT+ byte field says when it has nothing to report.
+const INVALID: u8 = 0xFF;
+
+/// The power page's update event count is a byte, so it rolls 256 times sooner
+/// than the revolution counters beside it.
+const EVENT_ROLLOVER: u16 = 256;
+
 /// Both counters in the combined page roll at 16 bits: the revolution count
 /// straightforwardly, and the event time because it is measured in 1/1024 s,
 /// which puts its wrap at exactly 64 seconds. A run of any length crosses the
@@ -123,6 +139,42 @@ pub fn csc_page(cadence: RevolutionState, speed: RevolutionState) -> [u8; 8] {
     page
 }
 
+/// The standard power-only page (device type 11, page 0x10).
+///
+/// Power is transmitted the same way speed is: as an accumulator the receiver
+/// differentiates, not as a reading. `accumulated` is the running sum of the
+/// instantaneous watts over every update event, so average power between two
+/// broadcasts is the change in the accumulator divided by the change in the
+/// event count — which is why the two have to move together or not at all.
+///
+/// They move on crank revolutions, which is what a real power meter does and
+/// what makes this worth simulating: a rider at 85 rpm produces 1.4 events a
+/// second against a 4 Hz broadcast, so roughly two broadcasts in three repeat
+/// the previous event count and accumulator exactly. A receiver that treated
+/// each broadcast as a new event would compute average power a third too low.
+#[must_use]
+pub fn power_page(crank: RevolutionState, watts: u16, cadence_rpm: f64) -> [u8; 8] {
+    let mut page = [0u8; 8];
+    page[0] = POWER_PAGE;
+    page[1] = (crank.revolutions % EVENT_ROLLOVER) as u8;
+    // Pedal power balance: a single-sided meter does not know it, and this is
+    // the value that says so rather than a zero that would read as "all right".
+    page[2] = INVALID;
+    let cadence = cadence_rpm.round();
+    page[3] = if (0.0..=254.0).contains(&cadence) {
+        cadence as u8
+    } else {
+        INVALID
+    };
+    // The accumulator only depends on the event count modulo its own rollover,
+    // so multiplying the already-rolled count is the same answer as rolling the
+    // product of the true one.
+    let accumulated = (u64::from(watts) * u64::from(crank.revolutions) % ROLLOVER) as u16;
+    page[4..6].copy_from_slice(&accumulated.to_le_bytes());
+    page[6..8].copy_from_slice(&watts.to_le_bytes());
+    page
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +263,73 @@ mod tests {
 
     /// Cadence occupies the low half and speed the high half. Swapping them
     /// yields a page that parses without complaint, so this is a golden.
+    /// The accumulator and the event count are what a receiver divides, so
+    /// their layout and their rollovers are pinned.
+    #[test]
+    fn the_power_page_carries_the_accumulator_the_event_count_and_the_watts() {
+        let crank = RevolutionState {
+            revolutions: 10,
+            event_time: 1234,
+        };
+        assert_eq!(
+            power_page(crank, 250, 85.0),
+            [
+                0x10, // page number
+                10,   // update event count
+                0xFF, // pedal power balance: not provided
+                85,   // instantaneous cadence
+                0xC4, 0x09, // accumulated power: 10 events x 250 W = 2500
+                0xFA, 0x00, // instantaneous power: 250 W
+            ]
+        );
+
+        // The event count is a byte and wraps 256 times sooner than the
+        // revolution counter it is taken from.
+        let wrapped = RevolutionState {
+            revolutions: 256,
+            event_time: 0,
+        };
+        assert_eq!(power_page(wrapped, 100, 85.0)[1], 0);
+        assert_eq!(
+            power_page(
+                RevolutionState {
+                    revolutions: 257,
+                    event_time: 0
+                },
+                100,
+                85.0
+            )[1],
+            1
+        );
+
+        // The accumulator rolls at 16 bits, and rolling the already-rolled
+        // revolution count gives the same answer as rolling the true product.
+        let acc = power_page(
+            RevolutionState {
+                revolutions: 1000,
+                event_time: 0,
+            },
+            100,
+            85.0,
+        );
+        assert_eq!(
+            u16::from_le_bytes([acc[4], acc[5]]),
+            (100u32 * 1000 % 65536) as u16
+        );
+    }
+
+    /// A cadence the field cannot hold is reported as absent rather than as a
+    /// number that would read as real.
+    #[test]
+    fn an_out_of_range_cadence_is_marked_invalid_rather_than_clamped() {
+        let crank = RevolutionState::default();
+        assert_eq!(power_page(crank, 200, 0.0)[3], 0);
+        assert_eq!(power_page(crank, 200, 254.0)[3], 254);
+        assert_eq!(power_page(crank, 200, 255.0)[3], 0xFF);
+        assert_eq!(power_page(crank, 200, -1.0)[3], 0xFF);
+        assert_eq!(power_page(crank, 200, f64::NAN)[3], 0xFF);
+    }
+
     #[test]
     fn the_combined_page_puts_cadence_first_and_speed_second_little_endian() {
         let cadence = RevolutionState {

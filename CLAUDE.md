@@ -25,7 +25,8 @@ cargo run -- --server <host:port> --hello_msg <msg> # Send hello before streamin
 cargo run --bin antsim -- --list-dongles           # Sticks on the bus and the fleet ceiling
 cargo run --bin antsim                             # 8 simulated bikes on one dongle
 cargo run --bin antsim -- --max                    # Fill every dongle found
-cargo run --bin antsim -- -n 24 --start-id 5000 --spread 10   # 24 bikes over 3 dongles
+cargo run --bin antsim -- --max --no-power         # Twice as many bikes, speed&cadence only
+cargo run --bin antsim -- --max --max-spread       # Fill them and fan across the whole range
 cargo fmt --check        # What CI checks
 cargo clippy --all-targets --locked -- -D warnings   # What CI GATES on
 ```
@@ -85,7 +86,10 @@ Docker build: `docker build -t antdump .`
   channels that put them on the air. Mirrors `init.rs` deliberately: same network key,
   same RF frequency, same confirm-every-step discipline, because a transmitter that
   disagrees with the receiver on any of those is not wrong, it is silent
-- **`Revolutions`** (`src/profile.rs`) — The counter model and the ANT+ page layouts
+- **`Revolutions`** (`src/profile.rs`) — The counter model, plus the combined speed and
+  cadence page (type 121, period 8086) and the standard power-only page (type 11, period
+  8182). Fitness equipment (type 17, period 8192) is the next one in, and needs only its
+  own page builder here and an arm in `Profile`
 - **`probe_channel`** (`src/init.rs`) — A channel status request for a caller that has heard
   nothing for a while: silence on an open channel is also what an empty room sounds like, so
   this is how a stick that went deaf mid-run is told apart from one with nothing to hear
@@ -152,12 +156,27 @@ Two consequences worth knowing:
 
 ### The simulator: eight per stick, and why one stick cannot test collisions
 
-**Eight devices per dongle is the radio's number, not a setting.** Both stick types this
+**Eight CHANNELS per dongle is the radio's number, not a setting.** Both stick types this
 crate has seen (0fcf:1008 and 0fcf:1009) are nRF24AP2-USB parts, which are eight-channel
-ANT network processors. A bigger fleet means more sticks; `antsim --list-dongles` prints
-what is on the bus and multiplies it out, and `--max` fills it without being told a count.
-The default is deliberately one dongle's worth rather than `--max`: a machine testing this
-needs a stick left over for `antdump` to listen on, so filling everything is opt-in. The air is nowhere near the constraint — 24
+ANT network processors. A bike needs one channel per sensor it carries, so the eight buy
+four bikes with speed&cadence and power, or eight with `--no-power`. `antsim --list-dongles`
+prints both ceilings and `--max` fills whichever applies without being told a count. The
+default is deliberately one dongle's worth rather than `--max`: a machine testing this needs
+a stick left over for `antdump` to listen on, so filling everything is opt-in.
+
+**A bike's sensors share its device number and differ only by device type.** That is how a
+real bike with a power meter appears, and it is what makes `DeviceKey`'s type field earn its
+keep: keyed on the number alone, a bike's CSC and power streams would arrive interleaved at
+~4 Hz each and `CollisionDetector` would false-collide them continuously. `FleetSpec::build`
+emits a bike's profiles adjacently so a chunk of eight keeps whole bikes on one stick.
+
+**Power is an accumulator, not a reading, and it advances on crank revolutions.** The page
+carries a running sum of instantaneous watts plus the update event count, and a receiver
+divides the two differences to get average power — so they have to move together or not at
+all. Both are driven off the same `Revolutions` as cadence, which means a rider at 85 rpm
+produces 1.4 events a second against a 4 Hz broadcast: roughly two broadcasts in three
+repeat the previous pair exactly. A receiver that treated each broadcast as a new event
+would compute average power a third too low, which is precisely the bug this catches. The air is nowhere near the constraint — 24
 devices at ~4 Hz is ~97 packets a second and an ANT+ packet is ~150 µs on the air, under
 2% duty cycle — so channel count is the only thing in the way.
 

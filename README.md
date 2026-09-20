@@ -15,11 +15,12 @@ sensors, so `antdump` can be pointed at traffic whose every counter is known in 
 SimulANT+ does this on Windows only; this runs wherever `antdump` does.
 
 ```
-antsim --list-dongles                          # sticks on the bus, and the fleet ceiling
-antsim                                         # 8 simulated bikes on one dongle
+antsim --list-dongles                          # sticks on the bus, and the fleet ceilings
+antsim                                         # one dongle's worth of bikes
 antsim --max                                   # fill every dongle found
+antsim --max --no-power                        # twice as many bikes, speed&cadence only
+antsim --max --max-spread                      # fill them and fan across the whole range
 antsim --max --dongle 168 --start-id 65532     # fill one stick, leave the rest to receive on
-antsim -n 24 --start-id 5000 --spread 10       # 24 bikes over 3 dongles, fanned out
 ```
 
 Each dongle carries **8 devices** — that is the radio's limit, not a setting, so a bigger
@@ -38,6 +39,9 @@ Two notes on testing with it:
 - **One dongle cannot produce a collision.** The ANT stack staggers the channels a single
   stick owns, so its devices never overlap on the air. Exercising `antdump`'s collision
   detection takes two dongles transmitting and a third to receive on.
-- **`--spread` is worth using.** Without it every device rides at the same speed and their
-  counters advance identically, so a receiver that attributed one device's page to another
-  would produce output indistinguishable from correct.
+- **`--spread` is worth using, and `--max-spread` more so.** Without a spread every bike
+  rides identically and their counters advance in lockstep, so a receiver that attributed
+  one bike's page to another would produce output indistinguishable from correct.
+  `--max-spread` fans the fleet from 5 to 60 km/h, whose endpoints straddle the profile's
+  own broadcast rate: the slow bikes repeat a counter for six broadcasts running while the
+  fast ones advance it by two between broadcasts, so both regimes are on the air at once.
