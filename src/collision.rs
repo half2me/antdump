@@ -27,7 +27,7 @@
 
 use crate::message::DeviceKey;
 use ant::messages::AntMessage;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use std::time::{Duration, Instant};
 
 /// Minimum quarantine hold before release. Generous next to the default
@@ -45,7 +45,16 @@ struct KeyState {
 pub struct CollisionDetector {
     threshold: Duration,
     hold: Duration,
-    device_state: HashMap<DeviceKey, KeyState>,
+    /// Insertion-ordered on purpose, and this is load-bearing rather than a
+    /// preference. `flush_expired_at` releases held messages by iterating this
+    /// map, so its order IS the order frames reach the pipeline when several
+    /// devices come out of quarantine together. A `HashMap` randomizes that
+    /// per process, which made a replay of the same bytes produce a different
+    /// frame order on every run and put the conformance goldens permanently
+    /// out of reach. `collision.ts` keys a JS `Map`, which iterates in
+    /// insertion order, so this is what "agree packet for packet" actually
+    /// requires.
+    device_state: IndexMap<DeviceKey, KeyState>,
     dropped: u64,
 }
 
@@ -54,7 +63,7 @@ impl CollisionDetector {
         Self {
             threshold,
             hold: threshold.max(MIN_HOLD),
-            device_state: HashMap::new(),
+            device_state: IndexMap::new(),
             dropped: 0,
         }
     }
@@ -283,5 +292,38 @@ mod tests {
     fn disabled_when_zero_threshold() {
         assert!(CollisionDetector::new(Duration::ZERO).is_disabled());
         assert!(!CollisionDetector::new(THRESHOLD).is_disabled());
+    }
+
+    /// The release order is a contract, not an accident. `flush_expired_at`
+    /// hands its vector straight to the pipeline, so this IS the order frames
+    /// are decoded and batched in when a roomful of devices leaves quarantine
+    /// together, and `collision.ts` iterates a JS `Map`, which is insertion
+    /// ordered. Under the `HashMap` this replaced, the order was randomized per
+    /// process: replaying one venue capture through the receiver produced a
+    /// different frame order on every run, so the conformance goldens could
+    /// never pass and the "agree packet for packet" claim was unprovable past
+    /// a handful of devices. One device is not enough to catch it, which is why
+    /// this uses sixteen.
+    #[test]
+    fn quarantine_releases_in_the_order_the_devices_were_first_heard() {
+        let keys: Vec<DeviceKey> = (0..16u32)
+            .map(|i| DeviceKey {
+                device_number: 1000 + i,
+                device_type_id: 11,
+            })
+            .collect();
+        let mut det = CollisionDetector::new(THRESHOLD);
+        let t0 = Instant::now();
+        for (step, key) in (0u64..).zip(&keys) {
+            det.feed_at(t0 + Duration::from_millis(step), *key, plain());
+        }
+
+        let released: Vec<DeviceKey> = det
+            .flush_expired_at(t0 + MIN_HOLD + Duration::from_secs(1))
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+
+        assert_eq!(released, keys, "released out of first-heard order");
     }
 }
