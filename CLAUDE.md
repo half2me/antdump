@@ -27,6 +27,7 @@ cargo run --bin antsim                             # 8 simulated bikes on one do
 cargo run --bin antsim -- --max                    # Fill every dongle found
 cargo run --bin antsim -- --max --no-power         # Twice as many bikes, speed&cadence only
 cargo run --bin antsim -- --max --max-spread       # Fill them and fan across the whole range
+cargo run --bin antsim -- --reset                  # Silence dongles left transmitting
 cargo fmt --check        # What CI checks
 cargo clippy --all-targets --locked -- -D warnings   # What CI GATES on
 ```
@@ -208,6 +209,18 @@ never touches. Device number 0 is ANT's wildcard and is refused rather than tran
 no timer and no sleeping in the transmit loop — `UsbDriver::get_message` already blocks up
 to 1 ms on its bulk read, so it self-throttles. It also means the displayed packet counts
 are transmissions that actually happened rather than payloads handed over.
+
+**An open master channel outlives the process that opened it, and this is the surprise
+that matters.** The dongle is an autonomous radio: once `OpenChannel` succeeds its firmware
+transmits at the channel period on its own and only asks the host for the *next* payload.
+Kill the process and the channel stays open — the stick keeps broadcasting the last payload
+it was handed, at full rate, until something resets it or it is unplugged. Observed
+directly: `antsim` killed, packets still on the air. `ant-rs` has no `Drop` that tears a
+channel down, so nothing does it implicitly. `antsim` therefore catches SIGINT and SIGTERM,
+and each dongle's own thread resets its stick before the process exits; `main` joins those
+threads rather than exiting, because exiting would race the reset. `antsim --reset` is the
+remedy for a stick left transmitting by something that died without doing this, and
+`configure_master`'s opening reset is why simply starting a new run also clears it.
 
 **Untested on hardware.** The simulator was written and unit-tested against a fake driver;
 no ANT+ dongle was available to the environment it was built in, so nothing below the USB

@@ -4,17 +4,38 @@
 //! of virtual sensors so the receiver can be checked against traffic whose
 //! every counter is known in advance.
 
+use antdump::init::reset;
 use antdump::sim::{
     CHANNELS_PER_DONGLE, DeviceState, FleetSpec, MasterOps, Profile, SPEED_CADENCE_AND_POWER,
-    SPEED_CADENCE_ONLY, SimDevice, capacity, run,
+    SPEED_CADENCE_ONLY, SimDevice, capacity, run, shut_down,
 };
-use antdump::usb::{DongleId, INIT_ATTEMPTS, bring_up_with, list_dongles};
+use antdump::usb::{DongleId, INIT_ATTEMPTS, bring_up_with, list_dongles, open_dongle};
 use clap::Parser;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{io, process, thread};
+
+/// Set by a signal handler, read by every transmit loop. An open master channel
+/// outlives the process that opened it, so Ctrl-C has to mean "close the
+/// channels and then exit" rather than just "exit".
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// The only thing a signal handler may safely do here: flip a flag. The
+/// closing down is done by the threads that own the dongles, once they notice.
+extern "C" fn on_signal(_: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+fn catch_interrupts() {
+    // SAFETY: `on_signal` only stores to an atomic, which is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+    }
+}
 
 /// Twice a second: fast enough to look live, slow enough that the numbers can
 /// be read as they change.
@@ -115,6 +136,11 @@ struct Args {
     #[arg(long)]
     list_dongles: bool,
 
+    /// Reset the dongles and exit, silencing any channels left transmitting by
+    /// a previous run that did not shut down cleanly. Respects `--dongle`.
+    #[arg(long)]
+    reset: bool,
+
     /// Transmit without drawing the status display.
     #[arg(long, short)]
     quiet: bool,
@@ -133,6 +159,10 @@ fn main() -> io::Result<()> {
     if args.list_dongles {
         return print_dongles();
     }
+    if args.reset {
+        return reset_dongles(args.dongle.as_deref());
+    }
+    catch_interrupts();
 
     let dongles = usable_dongles(args.dongle.as_deref())?;
     let profiles = if args.no_power {
@@ -180,11 +210,55 @@ fn main() -> io::Result<()> {
     let start = Instant::now();
     let stopped: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    for assignment in &assignments {
-        spawn_dongle(assignment, start, &stopped);
+    let threads: Vec<JoinHandle<()>> = assignments
+        .iter()
+        .map(|assignment| spawn_dongle(assignment, start, &stopped))
+        .collect();
+
+    // Deliberately not `?`: however the display ended, including on a write
+    // failing, every stick has to be put back before this process goes away.
+    // Returning first would leave the channels open, which is the whole
+    // failure this is here to prevent, so the outcome waits.
+    let outcome = display_loop(&assignments, start, &stopped, args.quiet);
+
+    SHUTDOWN.store(true, Ordering::SeqCst);
+    eprintln!(
+        "Stopping: closing channels on {} dongle(s)...",
+        threads.len()
+    );
+    // Joining is the point rather than politeness: each thread resets its own
+    // dongle, and exiting without waiting would race that reset.
+    for thread in threads {
+        let _ = thread.join();
     }
 
-    display_loop(&assignments, start, &stopped, args.quiet)
+    match outcome? {
+        Some(message) => fatal(&message),
+        None => Ok(()),
+    }
+}
+
+/// Reset every dongle the selector takes, so a stick left transmitting by a
+/// previous run goes quiet.
+fn reset_dongles(selector: Option<&str>) -> io::Result<()> {
+    let dongles = usable_dongles(selector)?;
+    let mut failed = false;
+    for dongle in &dongles {
+        match open_dongle(Some(&dongle.port))
+            .map_err(|err| err.to_string())
+            .and_then(|mut driver| reset(&mut driver).map_err(|err| err.to_string()))
+        {
+            Ok(()) => println!("{dongle}: reset"),
+            Err(err) => {
+                eprintln!("{dongle}: {err}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        process::exit(1);
+    }
+    Ok(())
 }
 
 /// Every ANT+ dongle on the bus, and the fleet size they add up to.
@@ -310,7 +384,11 @@ fn usable_dongles(selector: Option<&str>) -> io::Result<Vec<DongleId>> {
 /// because a fleet spread over several dongles must not reset or claim a
 /// neighbour's: resetting the wrong stick is precisely how one process leaves
 /// another's deaf.
-fn spawn_dongle(assignment: &Assignment, start: Instant, stopped: &Arc<Mutex<Option<String>>>) {
+fn spawn_dongle(
+    assignment: &Assignment,
+    start: Instant,
+    stopped: &Arc<Mutex<Option<String>>>,
+) -> JoinHandle<()> {
     let label = assignment.id.to_string();
     let port = assignment.id.port.clone();
     let devices = assignment.devices.clone();
@@ -327,7 +405,23 @@ fn spawn_dongle(assignment: &Assignment, start: Instant, stopped: &Arc<Mutex<Opt
         };
 
         let failure = match brought_up {
-            Ok(mut driver) => run(&mut driver, &devices, start, &sent).to_string(),
+            Ok(mut driver) => {
+                let outcome = run(&mut driver, &devices, start, &sent, &SHUTDOWN);
+                // Before anything else, and whether the loop ended by request
+                // or by failure: the channels are the dongle's state and
+                // stay open until something closes them.
+                if let Err(err) = shut_down(&mut driver) {
+                    eprintln!(
+                        "WARNING: {label}: {err}. It may still be transmitting; \
+                         `antsim --reset` or a replug will silence it."
+                    );
+                }
+                match outcome {
+                    // Asked to stop, and it did.
+                    Ok(()) => return,
+                    Err(err) => err.to_string(),
+                }
+            }
             Err(err) => match progress {
                 Some(channel) => format!("{err} (reached channel {channel})"),
                 None => err.to_string(),
@@ -339,16 +433,18 @@ fn spawn_dongle(assignment: &Assignment, start: Instant, stopped: &Arc<Mutex<Opt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_or_insert(format!("{label}: {failure}"));
-    });
+    })
 }
 
-/// Draw the fleet until a dongle stops, which ends the process.
+/// Draw the fleet until a dongle stops or an interrupt arrives. Returns the
+/// failure that ended it, if it was a failure — the caller still has to shut
+/// the dongles down either way.
 fn display_loop(
     assignments: &[Assignment],
     start: Instant,
     stopped: &Arc<Mutex<Option<String>>>,
     quiet: bool,
-) -> io::Result<()> {
+) -> io::Result<Option<String>> {
     let live = !quiet && io::stdout().is_terminal();
     if !live && !quiet {
         // Without a terminal to redraw in, the roster is printed once and the
@@ -359,15 +455,15 @@ fn display_loop(
 
     let mut drawn = 0usize;
     loop {
-        if let Some(failure) = stopped
+        let failure = stopped
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+            .clone();
+        if failure.is_some() || SHUTDOWN.load(Ordering::SeqCst) {
             if live && drawn > 0 {
                 println!();
             }
-            fatal(&failure);
+            return Ok(failure);
         }
 
         if live {

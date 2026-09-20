@@ -43,7 +43,7 @@ use ant::messages::config::{
 use ant::messages::control::OpenChannel;
 use ant::messages::data::BroadcastData;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The nRF24AP2-USB is an eight-channel part, so eight masters is the whole
@@ -435,7 +435,8 @@ pub fn configure_master<E, D: Driver<E>>(
 }
 
 /// Why a running simulator stopped. All three are the dongle going away in one
-/// form or another; none of them are recoverable in place.
+/// form or another; none of them are recoverable in place. Being asked to stop
+/// is not one of them — that is [`run`] returning `Ok`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SimError {
     /// The driver failed to read. The stick is gone or the handle is stale.
@@ -462,7 +463,8 @@ impl fmt::Display for SimError {
 
 impl std::error::Error for SimError {}
 
-/// Feed one dongle's open master channels until something breaks.
+/// Feed one dongle's open master channels until something breaks or `stop` is
+/// set, which returns `Ok` and leaves the caller to [`shut_down`] the stick.
 ///
 /// `sent[i]` counts transmissions on channel `i`. It is bumped on `EVENT_TX`,
 /// which the radio raises after a transmission has gone out, so the number is
@@ -472,12 +474,16 @@ pub fn run<E, D: Driver<E>>(
     devices: &[SimDevice],
     start: Instant,
     sent: &[AtomicU64],
-) -> SimError {
+    stop: &AtomicBool,
+) -> Result<(), SimError> {
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let msg = match driver.get_message() {
             Ok(Some(msg)) => msg,
             Ok(None) => continue,
-            Err(_) => return SimError::Driver,
+            Err(_) => return Err(SimError::Driver),
         };
         let RxMessage::ChannelEvent(event) = msg.message else {
             continue;
@@ -493,16 +499,35 @@ pub fn run<E, D: Driver<E>>(
                     .send_message(&BroadcastData::new(channel, page))
                     .is_err()
                 {
-                    return SimError::Write { channel };
+                    return Err(SimError::Write { channel });
                 }
                 if let Some(counter) = sent.get(channel as usize) {
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            MessageCode::EventChannelClosed => return SimError::ChannelClosed { channel },
+            MessageCode::EventChannelClosed => {
+                return Err(SimError::ChannelClosed { channel });
+            }
             _ => (),
         }
     }
+}
+
+/// Put a stick back the way it was found, and prove it took.
+///
+/// **This is not optional tidying.** An open master channel belongs to the
+/// dongle's firmware, not to this process: the radio transmits at the channel
+/// period on its own and only asks the host for the *next* payload. A process
+/// that exits without closing it leaves the stick broadcasting the last
+/// payload it was handed, at full rate, until something resets it or it is
+/// unplugged — stale frames carrying frozen counters, on the same frequency a
+/// capture is being taken on.
+///
+/// A reset rather than a `CloseChannel` per channel: it takes every channel
+/// down in one message whatever state they were each in, and it is the one
+/// message the dongle always answers, so the answer is the proof.
+pub fn shut_down<E, D: Driver<E>>(driver: &mut D) -> Result<(), InitError> {
+    reset(driver)
 }
 
 /// The retry loop from [`crate::usb`], configuring masters instead of a
@@ -561,6 +586,7 @@ mod tests {
     use packed_struct::PackedStructSlice;
     use packed_struct::PrimitiveEnum;
     use packed_struct::types::SizedInteger;
+    use std::sync::Arc;
 
     #[derive(Debug)]
     struct FakeError;
@@ -574,6 +600,10 @@ mod tests {
         /// A message id to refuse rather than accept.
         refuse: Option<TxMessageId>,
         read_fails: bool,
+        /// Raise this flag once the loop has asked for this many messages, so
+        /// a stop arriving mid-run can be tested without a race.
+        stop_after: Option<(usize, Arc<AtomicBool>)>,
+        reads: usize,
     }
 
     impl FakeDongle {
@@ -583,6 +613,8 @@ mod tests {
                 pending: Vec::new(),
                 refuse: None,
                 read_fails: false,
+                stop_after: None,
+                reads: 0,
             }
         }
 
@@ -608,6 +640,12 @@ mod tests {
         fn get_message(&mut self) -> Result<Option<AntMessage>, DriverError<FakeError>> {
             if self.read_fails {
                 return Err(DriverError::BadLength(0, 0));
+            }
+            self.reads += 1;
+            if let Some((after, flag)) = &self.stop_after
+                && self.reads > *after
+            {
+                flag.store(true, Ordering::Relaxed);
             }
             Ok(if self.pending.is_empty() {
                 None
@@ -931,8 +969,8 @@ mod tests {
         // still does not.
         let start = Instant::now() - Duration::from_secs(10);
         assert_eq!(
-            run(&mut dongle, &devices, start, &sent),
-            SimError::ChannelClosed { channel: 1 }
+            run(&mut dongle, &devices, start, &sent, &AtomicBool::new(false)),
+            Err(SimError::ChannelClosed { channel: 1 })
         );
 
         let broadcasts = dongle.broadcasts();
@@ -950,6 +988,49 @@ mod tests {
         assert_eq!(sent[1].load(Ordering::Relaxed), 1);
     }
 
+    /// The bug this exists for: an open master channel belongs to the dongle,
+    /// so a run that ends without closing it leaves the stick transmitting the
+    /// last payload for as long as it is plugged in.
+    #[test]
+    fn being_asked_to_stop_ends_the_run_cleanly_and_the_reset_takes_the_channels_down() {
+        let mut dongle = FakeDongle::new();
+        let devices = spec(1).build().unwrap();
+        let sent = vec![AtomicU64::new(0)];
+        let stop = AtomicBool::new(true);
+
+        // Asked to stop before it started: not a failure, and nothing sent.
+        assert_eq!(
+            run(&mut dongle, &devices, Instant::now(), &sent, &stop),
+            Ok(())
+        );
+        assert!(dongle.broadcasts().is_empty());
+
+        // And the caller's shut down is what actually silences the stick.
+        assert_eq!(shut_down(&mut dongle), Ok(()));
+        assert_eq!(dongle.ids(), vec![TxMessageId::ResetSystem]);
+    }
+
+    /// A stop raised while the loop is running is noticed at the next turn,
+    /// after the work already in hand is finished rather than instead of it.
+    #[test]
+    fn a_stop_raised_mid_run_is_noticed_at_the_next_turn_of_the_loop() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut dongle = FakeDongle::new();
+        // The flag goes up only once the loop has come back for a second
+        // message, so the first event is genuinely handled before the stop.
+        dongle.stop_after = Some((1, Arc::clone(&stop)));
+        dongle.pending.push(channel_event(0, MessageCode::EventTx));
+
+        let devices = spec(1).build().unwrap();
+        let sent = vec![AtomicU64::new(0)];
+        assert_eq!(
+            run(&mut dongle, &devices, Instant::now(), &sent, &stop),
+            Ok(())
+        );
+        assert_eq!(dongle.broadcasts().len(), 1, "the event in hand was served");
+        assert_eq!(sent[0].load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn a_dongle_that_stops_answering_ends_the_run_rather_than_spinning() {
         let mut dongle = FakeDongle::new();
@@ -957,8 +1038,14 @@ mod tests {
         let devices = spec(1).build().unwrap();
         let sent = vec![AtomicU64::new(0)];
         assert_eq!(
-            run(&mut dongle, &devices, Instant::now(), &sent),
-            SimError::Driver
+            run(
+                &mut dongle,
+                &devices,
+                Instant::now(),
+                &sent,
+                &AtomicBool::new(false)
+            ),
+            Err(SimError::Driver)
         );
     }
 
@@ -974,8 +1061,14 @@ mod tests {
         let devices = spec(1).build().unwrap();
         let sent = vec![AtomicU64::new(0)];
         assert_eq!(
-            run(&mut dongle, &devices, Instant::now(), &sent),
-            SimError::ChannelClosed { channel: 0 }
+            run(
+                &mut dongle,
+                &devices,
+                Instant::now(),
+                &sent,
+                &AtomicBool::new(false)
+            ),
+            Err(SimError::ChannelClosed { channel: 0 })
         );
         assert!(dongle.broadcasts().is_empty());
     }

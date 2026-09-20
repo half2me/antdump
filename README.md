@@ -21,7 +21,15 @@ antsim --max                                   # fill every dongle found
 antsim --max --no-power                        # twice as many bikes, speed&cadence only
 antsim --max --max-spread                      # fill them and fan across the whole range
 antsim --max --dongle 168 --start-id 65532     # fill one stick, leave the rest to receive on
+antsim --reset                                 # silence dongles left transmitting
 ```
+
+**Stopping it matters.** An ANT dongle is an autonomous radio: once a channel is open its
+firmware transmits on its own schedule and only asks the host for the next payload, so a
+process that dies without closing the channel leaves the stick broadcasting its last
+payload — frozen counters at full rate — until it is reset or unplugged. `antsim` closes
+its channels on Ctrl-C. If something killed it harder than that, `antsim --reset` silences
+the sticks, and so does simply starting another run.
 
 Each dongle carries **8 devices** — that is the radio's limit, not a setting, so a bigger
 fleet needs more sticks. `--max` fills whatever is plugged in rather than making you count;
