@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Antdump is a Rust CLI tool that sniffs ANT+ wireless data from the air using a USB dongle in `OpenRXScanMode`. Captured data is printed as raw hex to the console and can optionally be forwarded to a TCP server. The USB traffic can also be captured by Wireshark for analysis with an ANT+ dissector.
 
+The crate ships a second binary, **`antsim`**, which is the other half of the test loop:
+it transmits a fleet of simulated ANT+ bike sensors so `antdump` can be checked against
+traffic whose every counter is known in advance. Nothing off the shelf does this on Linux
+or macOS — SimulANT+ is Windows-only, and the open-source ANT+ transmitters that do run
+here (antifier, FortiusANT, openant's examples) each simulate exactly one device.
+
 ## Build & Run
 
 ```bash
@@ -15,6 +21,10 @@ cargo test               # Unit + pipeline tests
 cargo run                # Run (auto-detects first ANT+ USB dongle)
 cargo run -- --server <host:port>                  # Forward data to TCP server
 cargo run -- --server <host:port> --hello_msg <msg> # Send hello before streaming
+
+cargo run --bin antsim -- --list-dongles           # Sticks on the bus and the fleet ceiling
+cargo run --bin antsim                             # 8 simulated bikes on one dongle
+cargo run --bin antsim -- -n 24 --start-id 5000 --spread 10   # 24 bikes over 3 dongles
 cargo fmt --check        # What CI checks
 cargo clippy --all-targets --locked -- -D warnings   # What CI GATES on
 ```
@@ -62,6 +72,19 @@ Docker build: `docker build -t antdump .`
   `NoDongle` and an init failure as two different states; `antdump` exits after three.
   The library never prints: each failed attempt goes to the caller's `report` callback,
   so the receiver logs it with a timestamp and `antdump` writes it to stderr
+- **`antsim`** (`src/bin/antsim.rs`) — The simulator's CLI and its live status display:
+  a redrawn table of every device with its key, dongle, channel, speed, cadence, live
+  revolution counts and transmitted-packet count, plus fleet totals and the packet rate
+  the radios *should* be managing, since a measured rate below it is the fleet losing
+  transmissions. The key column is formatted `device_number:device_type_id`, which is
+  exactly what `antdump` prints in front of every packet, so the two outputs line up by
+  eye and by `grep`. Falls back to a periodic one-line summary when stdout is not a
+  terminal
+- **`SimDevice` / `FleetSpec`** (`src/sim.rs`) — A fleet of virtual bikes and the master
+  channels that put them on the air. Mirrors `init.rs` deliberately: same network key,
+  same RF frequency, same confirm-every-step discipline, because a transmitter that
+  disagrees with the receiver on any of those is not wrong, it is silent
+- **`Revolutions`** (`src/profile.rs`) — The counter model and the ANT+ page layouts
 - **`probe_channel`** (`src/init.rs`) — A channel status request for a caller that has heard
   nothing for a while: silence on an open channel is also what an empty room sounds like, so
   this is how a stick that went deaf mid-run is told apart from one with nothing to hear
@@ -125,6 +148,48 @@ Two consequences worth knowing:
   are present, because wall-clock gaps collapse toward zero whenever the host batches several
   USB reads after a stall, which false-collides perfectly good messages. Without them it falls
   back to wall-clock timing, which is what a clone gets.
+
+### The simulator: eight per stick, and why one stick cannot test collisions
+
+**Eight devices per dongle is the radio's number, not a setting.** Both stick types this
+crate has seen (0fcf:1008 and 0fcf:1009) are nRF24AP2-USB parts, which are eight-channel
+ANT network processors. A bigger fleet means more sticks; `antsim --list-dongles` prints
+what is on the bus and multiplies it out. The air is nowhere near the constraint — 24
+devices at ~4 Hz is ~97 packets a second and an ANT+ packet is ~150 µs on the air, under
+2% duty cycle — so channel count is the only thing in the way.
+
+**A single stick cannot produce a collision, by design.** The ANT stack time-division
+schedules the channels it owns, so eight masters on one dongle are staggered deliberately
+and never overlap. That makes one stick the right tool for checking that counters parse
+and the wrong tool entirely for exercising `CollisionDetector`: for that the transmissions
+have to come from radios that do not know about each other, which means two dongles
+transmitting and a third receiving.
+
+**The counters repeat on purpose, because real ones do.** ANT+ profiles do not transmit
+speed; they transmit a cumulative revolution count and the time of the revolution that
+bumped it, and the receiver divides. A real sensor's counter only moves when a magnet
+passes, which is not in step with its 4 Hz broadcast, so below ~4 rev/s the same count and
+the same event time go out several broadcasts running. `Revolutions::at` reports the state
+as of the last revolution to have actually happened, so the repeats fall out of the
+arithmetic — a simulator that incremented per broadcast would never produce them, and a
+parser that mishandled them would pass the test. Both counters roll at 16 bits, which puts
+the event time's wrap at exactly 64 seconds: a run of any length crosses it constantly.
+
+**Device numbers are 20 bits and the top four are not in the channel id.** `SimDevice::channel_id`
+puts the low 16 bits in the channel id and the top 4 in the transmission type's extension
+nibble, which is exactly how `DeviceKey::from_broadcast` puts them back together. So
+`--start-id 70000` exercises a branch of the receiver that a fleet numbered below 65536
+never touches. Device number 0 is ANT's wildcard and is refused rather than transmitted.
+
+**The radio sets the pace.** An open master channel transmits on its own period and raises
+`EVENT_TX` when it has done so; `sim::run` answers each one with the next payload. There is
+no timer and no sleeping in the transmit loop — `UsbDriver::get_message` already blocks up
+to 1 ms on its bulk read, so it self-throttles. It also means the displayed packet counts
+are transmissions that actually happened rather than payloads handed over.
+
+**Untested on hardware.** The simulator was written and unit-tested against a fake driver;
+no ANT+ dongle was available to the environment it was built in, so nothing below the USB
+boundary has been exercised on air.
 
 ## Key Dependencies
 
