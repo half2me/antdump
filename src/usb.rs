@@ -62,7 +62,8 @@ impl fmt::Display for BringUpError {
 
 impl std::error::Error for BringUpError {}
 
-/// One stick as the bus describes it, so two on one machine can be told apart.
+/// One stick as the bus describes it, so two on one machine can be told apart
+/// and a diagnostic line can say more than "found a dongle".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DongleId {
     /// Bus and port chain, `20-1.4`: the socket the stick is in, which a reset
@@ -70,6 +71,12 @@ pub struct DongleId {
     pub port: String,
     /// The USB serial string, when the stick reports one.
     pub serial: Option<String>,
+    /// The USB product string, when the stick reports one (e.g. "Movestick mini").
+    pub product: Option<String>,
+    /// From the device descriptor; `0x0000` on the two sticks we own when the
+    /// descriptor itself could not be read, which is not a case seen in practice.
+    pub vendor_id: u16,
+    pub product_id: u16,
 }
 
 impl DongleId {
@@ -82,20 +89,26 @@ impl DongleId {
             .map(u8::to_string)
             .collect::<Vec<_>>()
             .join(".");
-        let serial = device
-            .device_descriptor()
-            .ok()
-            .and_then(|desc| {
-                device
-                    .open()
-                    .ok()?
-                    .read_serial_number_string_ascii(&desc)
-                    .ok()
-            })
-            .and_then(|raw| clean_serial(&raw));
+        let desc = device.device_descriptor().ok();
+        let handle = device.open().ok();
+        let serial = desc
+            .as_ref()
+            .zip(handle.as_ref())
+            .and_then(|(desc, handle)| handle.read_serial_number_string_ascii(desc).ok())
+            .and_then(|raw| clean_usb_string(&raw));
+        let product = desc
+            .as_ref()
+            .zip(handle.as_ref())
+            .and_then(|(desc, handle)| handle.read_product_string_ascii(desc).ok())
+            .and_then(|raw| clean_usb_string(&raw));
+        let (vendor_id, product_id) =
+            desc.map_or((0, 0), |desc| (desc.vendor_id(), desc.product_id()));
         Self {
             port: format!("{}-{chain}", device.bus_number()),
             serial,
+            product,
+            vendor_id,
+            product_id,
         }
     }
 
@@ -106,20 +119,28 @@ impl DongleId {
     }
 }
 
-/// A stick's serial descriptor can claim more bytes than it sends, so libusb
-/// hands back the serial, a NUL and whatever its buffer held behind it (both
-/// Dynastream sticks on the bench did this). The serial is what is before
-/// the NUL.
-fn clean_serial(raw: &str) -> Option<String> {
-    let serial = raw.split('\0').next().unwrap_or_default().trim();
-    (!serial.is_empty()).then(|| serial.to_owned())
+/// A USB descriptor string can claim more bytes than it sends, so libusb hands
+/// back the string, a NUL and whatever its buffer held behind it (both
+/// Dynastream sticks on the bench did this for their serial). What is wanted
+/// is what is before the NUL.
+fn clean_usb_string(raw: &str) -> Option<String> {
+    let text = raw.split('\0').next().unwrap_or_default().trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 impl fmt::Display for DongleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} {:04x}:{:04x}",
+            self.port, self.vendor_id, self.product_id
+        )?;
+        if let Some(product) = &self.product {
+            write!(f, " {product}")?;
+        }
         match &self.serial {
-            Some(serial) => write!(f, "{} serial {serial}", self.port),
-            None => write!(f, "{} (no serial)", self.port),
+            Some(serial) => write!(f, " serial {serial}"),
+            None => write!(f, " (no serial)"),
         }
     }
 }
@@ -314,34 +335,46 @@ mod tests {
         let stick = DongleId {
             port: "20-1.4".to_owned(),
             serial: Some("1024".to_owned()),
+            product: Some("Movestick mini".to_owned()),
+            vendor_id: 0x0fcf,
+            product_id: 0x1009,
         };
         assert!(stick.matches(None));
         assert!(stick.matches(Some("1024")));
         assert!(stick.matches(Some("20-1.4")));
         assert!(!stick.matches(Some("1025")));
         assert!(!stick.matches(Some("20-1")));
-        assert_eq!(stick.to_string(), "20-1.4 serial 1024");
+        assert_eq!(
+            stick.to_string(),
+            "20-1.4 0fcf:1009 Movestick mini serial 1024"
+        );
 
         let mute = DongleId {
             port: "1-2".to_owned(),
             serial: None,
+            product: None,
+            vendor_id: 0,
+            product_id: 0,
         };
         assert!(mute.matches(None));
         assert!(mute.matches(Some("1-2")));
         assert!(!mute.matches(Some("")));
-        assert_eq!(mute.to_string(), "1-2 (no serial)");
+        assert_eq!(mute.to_string(), "1-2 0000:0000 (no serial)");
     }
 
     #[test]
-    fn a_serial_is_what_the_stick_sent_before_the_nul_and_the_buffer_junk_behind_it() {
-        assert_eq!(clean_serial("1550803364\0").as_deref(), Some("1550803364"));
+    fn a_usb_string_is_what_the_stick_sent_before_the_nul_and_the_buffer_junk_behind_it() {
         assert_eq!(
-            clean_serial("168\0?c?\0\0\0?c?\0\0DSI\0H").as_deref(),
+            clean_usb_string("1550803364\0").as_deref(),
+            Some("1550803364")
+        );
+        assert_eq!(
+            clean_usb_string("168\0?c?\0\0\0?c?\0\0DSI\0H").as_deref(),
             Some("168")
         );
-        assert_eq!(clean_serial(" 42 ").as_deref(), Some("42"));
-        assert_eq!(clean_serial(""), None);
-        assert_eq!(clean_serial("\0DSI"), None);
+        assert_eq!(clean_usb_string(" 42 ").as_deref(), Some("42"));
+        assert_eq!(clean_usb_string(""), None);
+        assert_eq!(clean_usb_string("\0DSI"), None);
     }
 
     #[test]
