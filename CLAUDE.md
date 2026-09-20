@@ -24,6 +24,7 @@ cargo run -- --server <host:port> --hello_msg <msg> # Send hello before streamin
 
 cargo run --bin antsim -- --list-dongles           # Sticks on the bus and the fleet ceiling
 cargo run --bin antsim                             # 8 simulated bikes on one dongle
+cargo run --bin antsim -- --max                    # Fill every dongle found
 cargo run --bin antsim -- -n 24 --start-id 5000 --spread 10   # 24 bikes over 3 dongles
 cargo fmt --check        # What CI checks
 cargo clippy --all-targets --locked -- -D warnings   # What CI GATES on
@@ -154,7 +155,9 @@ Two consequences worth knowing:
 **Eight devices per dongle is the radio's number, not a setting.** Both stick types this
 crate has seen (0fcf:1008 and 0fcf:1009) are nRF24AP2-USB parts, which are eight-channel
 ANT network processors. A bigger fleet means more sticks; `antsim --list-dongles` prints
-what is on the bus and multiplies it out. The air is nowhere near the constraint — 24
+what is on the bus and multiplies it out, and `--max` fills it without being told a count.
+The default is deliberately one dongle's worth rather than `--max`: a machine testing this
+needs a stick left over for `antdump` to listen on, so filling everything is opt-in. The air is nowhere near the constraint — 24
 devices at ~4 Hz is ~97 packets a second and an ANT+ packet is ~150 µs on the air, under
 2% duty cycle — so channel count is the only thing in the way.
 

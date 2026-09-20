@@ -17,11 +17,14 @@ SimulANT+ does this on Windows only; this runs wherever `antdump` does.
 ```
 antsim --list-dongles                          # sticks on the bus, and the fleet ceiling
 antsim                                         # 8 simulated bikes on one dongle
+antsim --max                                   # fill every dongle found
+antsim --max --dongle 168 --start-id 65532     # fill one stick, leave the rest to receive on
 antsim -n 24 --start-id 5000 --spread 10       # 24 bikes over 3 dongles, fanned out
 ```
 
 Each dongle carries **8 devices** — that is the radio's limit, not a setting, so a bigger
-fleet needs more sticks. Devices are combined speed and cadence sensors (ANT+ device type
+fleet needs more sticks. `--max` fills whatever is plugged in rather than making you count;
+combined with `--dongle` it fills that one stick and leaves the others free. Devices are combined speed and cadence sensors (ANT+ device type
 121) transmitting at the profile's 4.05 Hz, numbered upwards from `--start-id`; a start
 above 65535 is legal and exercises the receiver's 20-bit device number path.
 

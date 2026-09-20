@@ -26,9 +26,15 @@ const MAX_ROWS: usize = 32;
 #[command(version, about, long_about = None)]
 struct Args {
     /// How many devices to simulate. Each dongle carries 8, so a bigger fleet
-    /// uses more dongles; `--list-dongles` prints the ceiling.
-    #[arg(long, short = 'n', default_value_t = 8)]
-    devices: usize,
+    /// uses more dongles; `--list-dongles` prints the ceiling. [default: 8]
+    #[arg(long, short = 'n', conflicts_with = "max")]
+    devices: Option<usize>,
+
+    /// Fill every dongle: simulate 8 devices on each one found, which is as
+    /// many as the hardware can carry. Respects `--dongle`, so naming one stick
+    /// fills that stick alone and leaves the others free to receive on.
+    #[arg(long, conflicts_with = "devices")]
+    max: bool,
 
     /// ANT+ device number of the first device; the rest count up from it.
     /// Numbers above 65535 are legal and exercise the receiver's 20-bit path.
@@ -86,7 +92,7 @@ fn main() -> io::Result<()> {
 
     let dongles = usable_dongles(args.dongle.as_deref())?;
     let spec = FleetSpec {
-        devices: args.devices,
+        devices: fleet_size(args.max, args.devices, &dongles),
         start_id: args.start_id,
         profile: Profile::SpeedAndCadence,
         speed_kph: args.speed,
@@ -147,6 +153,7 @@ fn print_dongles() -> io::Result<()> {
     println!(
         "{CHANNELS_PER_DONGLE} is the radio's limit, not a setting: these sticks are eight-channel parts."
     );
+    println!("Run `antsim --max` to fill them, or `--max --dongle <serial>` to fill just one.");
     if dongles.len() == 1 {
         println!();
         println!(
@@ -156,6 +163,16 @@ fn print_dongles() -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// How many devices to simulate: as many as the hardware carries under
+/// `--max`, otherwise what was asked for, otherwise one dongle's worth.
+fn fleet_size(max: bool, devices: Option<usize>, dongles: &[DongleId]) -> usize {
+    if max {
+        capacity(dongles)
+    } else {
+        devices.unwrap_or(CHANNELS_PER_DONGLE)
+    }
 }
 
 /// The dongles the fleet may use, which is every one on the bus unless the
@@ -477,6 +494,28 @@ mod tests {
             frame.lines().filter(|l| l.contains(":121")).count(),
             MAX_ROWS
         );
+    }
+
+    #[test]
+    fn max_fills_every_dongle_and_an_explicit_count_still_wins() {
+        let two = [
+            DongleId {
+                port: "1-1.2".to_owned(),
+                serial: Some("134".to_owned()),
+            },
+            DongleId {
+                port: "1-1.3".to_owned(),
+                serial: Some("168".to_owned()),
+            },
+        ];
+        assert_eq!(fleet_size(true, None, &two), 16);
+        assert_eq!(fleet_size(false, Some(3), &two), 3);
+        // No flag and no count is one dongle's worth, whatever is plugged in,
+        // so the default leaves the other sticks free to receive on.
+        assert_eq!(fleet_size(false, None, &two), 8);
+        assert_eq!(fleet_size(false, None, &two[..1]), 8);
+        // `--max` with a single stick selected fills that stick alone.
+        assert_eq!(fleet_size(true, None, &two[..1]), 8);
     }
 
     #[test]
