@@ -63,7 +63,12 @@ impl fmt::Display for BringUpError {
 impl std::error::Error for BringUpError {}
 
 /// One stick as the bus describes it, so two on one machine can be told apart
-/// and a diagnostic line can say more than "found a dongle".
+/// and a diagnostic line can say more than "found a dongle". `non_exhaustive`
+/// because it is public and its fields grow (the product string and the USB
+/// id were added after callers outside this crate already existed): a struct
+/// literal built from outside would otherwise stop compiling on every field
+/// this type gains, rather than on the ones a caller actually reads.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DongleId {
     /// Bus and port chain, `20-1.4`: the socket the stick is in, which a reset
