@@ -80,7 +80,11 @@ pub struct CollisionStats {
     /// Events whose gap fell in `GAP_TIGHT..GAP_LOOSE`.
     pub gap_1_to_5ms: u64,
     /// Events whose gap was `GAP_LOOSE` or more, up to the threshold.
-    pub gap_over_5ms: u64,
+    ///
+    /// Named for the boundary it INCLUDES: the buckets are half-open, so a gap
+    /// of exactly 5 ms is counted here rather than below, and a name reading
+    /// "over 5 ms" would say the opposite of what the code does.
+    pub gap_5ms_or_more: u64,
 }
 
 impl CollisionStats {
@@ -172,7 +176,14 @@ impl CollisionDetector {
 
         let gap = now.duration_since(entry.last_wall);
         if gap < self.threshold {
-            println!("WARNING: Collision on {key} after {gap:?}, dropping messages");
+            // No print here. This is the hot path of a receiver that runs
+            // forever on a Pi, and a synchronous write to the journal per
+            // collision stalls the USB read loop — which lets the dongle
+            // buffer, and a backlog read back to back is what gets counted as
+            // the next collision. A counter that can feed itself is worse than
+            // useless. `stats()` carries everything the line said, and
+            // `main.rs` prints it for the CLI, which is where the library's own
+            // rule puts it: the library never prints.
             let paired = entry.pending.is_some();
             self.dropped += if paired { 2 } else { 1 };
             if paired {
@@ -185,7 +196,7 @@ impl CollisionDetector {
             } else if gap < GAP_LOOSE {
                 self.stats.gap_1_to_5ms += 1;
             } else {
-                self.stats.gap_over_5ms += 1;
+                self.stats.gap_5ms_or_more += 1;
             }
             entry.pending = None;
             entry.last_wall = now;
@@ -472,8 +483,8 @@ mod tests {
         assert_eq!(stats.gap_under_1ms, 1, "only the sub-millisecond pair");
         assert_eq!(stats.gap_1_to_5ms, 2, "1ms is in, 5ms is out");
         assert_eq!(
-            stats.gap_over_5ms, 2,
-            "5ms and everything up to the threshold"
+            stats.gap_5ms_or_more, 2,
+            "5ms itself, and everything up to the threshold"
         );
         assert_eq!(stats.pairs, 5);
         assert_eq!(stats.events(), stats.pairs);

@@ -69,23 +69,33 @@ Docker build: `docker build -t antdump .`
   nothing for a while: silence on an open channel is also what an empty room sounds like, so
   this is how a stick that went deaf mid-run is told apart from one with nothing to hear
 
-### Extended RX data: the ORDER of the two enable messages matters
+### Extended RX data: the channel id block, and nothing else
 
-`configure` sends `EnableExtRxMessages` and THEN `LibConfig`, and that order is load-bearing.
-`EnableExtRxMessages` is the legacy switch and turns on the channel id block only; `LibConfig`
-supersedes it and is the only way to get RX timestamps. Legacy first means a clone
-dongle that quietly ignores LibConfig still reports channel ids, while real firmware ends up
-with both blocks because LibConfig lands last. Failure is logged, never fatal. **RSSI is not
-requested at all** (`LibConfig::new(true, false, true)`): the register never moved on any
-stick we own (below), so the block would only cost bytes. `serialize_broadcast` still writes
-one back if a dongle sends it anyway.
+`configure` sends **`EnableExtRxMessages` and nothing else** (`src/init.rs`). It is the legacy
+switch and turns on the channel id block, which is the only extended data anything here reads:
+`DeviceKey` is built from it and the collision quarantine is keyed by it.
+
+**`LibConfig` is deliberately not sent**, because both things it adds are unwanted. RSSI,
+because every stick on the bench reports the AGC register rather than dBm and that register was
+measured byte-identical from point-blank to out of range (below), so the block would cost bytes
+a frame and tell nobody anything. And RX timestamps, because `CollisionDetector` times on the
+HOST's arrival clock instead: a stamp riding inside a frame can be garbled by the very fault the
+detector exists to catch, and the resolution it buys is not needed, a venue capture putting the
+normal cadence 200x away from the collision window. That choice has a cost, and
+`CollisionStats`'s gap buckets are what measures it: arrival gaps collapse toward zero when the
+host batches several USB reads after a stall, which false-collides good messages, and a gap
+several milliseconds wide is how one of those is told from a real collision.
+
+So a frame today carries the channel id block alone. `serialize_broadcast` still writes back the
+RSSI and timestamp blocks, because a dongle that sends one unasked has to be round-tripped
+faithfully: the flag byte and the header's length are copied from the original, so a block that
+is announced but not written leaves the reader parsing the checksum as payload.
 
 **Whether the dongle ACCEPTED anything is a separate message.** `send_message` returns once
 the bytes are on the bulk endpoint, so its `Ok` means "written", not "accepted". `src/init.rs`
 therefore confirms every message the channel depends on, and a reset is the probe: it always
 answers with a startup notification, so silence there means the dongle is not listening and
-nothing after it will change that. A refused `LibConfig` is the one degradation rather than a
-failure, since the legacy switch already carries channel ids.
+nothing after it will change that.
 
 **A deaf dongle is the failure that matters, and a restart does not clear it.** Seen on a Pi:
 restart antdump and the stick stays silent until it is physically unplugged. `UsbDriver::new`
@@ -102,36 +112,31 @@ a reset at all. A long-running caller therefore cannot treat "dongle up" as sett
 `probe_channel` asks the stick for channel 0's status whenever the air has been quiet for a
 few seconds, and a missing answer or a channel that is not open means bring it up again.
 
-**Bench results (two genuine Dynastream sticks, 0fcf:1009 and 0fcf:1008, 307 frames, captured
-while LibConfig still requested RSSI; today's frames carry two blocks, `flag=A0`):** the
-order lands — `flag=E0`, all three blocks, on every frame. Both answered LibConfig with
-`ResponseNoError` in 1.8 ms and 10.4 ms, so the 500 ms window is generous. Both report **AGC**
-RSSI (`0x10`, 4 bytes), so the dBm branch is still unexercised, and no clone was available, so
+**Bench results, HISTORICAL (two genuine Dynastream sticks, 0fcf:1009 and 0fcf:1008, 307
+frames).** They were captured back when `configure` still sent `LibConfig` and still asked for
+RSSI, so those frames carry all three blocks (`flag=E0`) where today's carry the channel id
+alone. They are kept because they are the evidence behind two decisions that still stand: both
+sticks answered LibConfig with `ResponseNoError` in 1.8 ms and 10.4 ms, and both report **AGC**
+RSSI (`0x10`, 4 bytes), so the dBm branch is unexercised and, no clone having been available,
 the fallback path stays unobserved.
 
 **There is no usable RSSI on this hardware.** Every stick tried reports AGC, and the register
 does not move: walking a sensor to the edge of range and out of it left it byte-identical, and
 then the packets stopped. So signal strength is not a thing this tool can report, and anything
-that wants a proximity or link-quality signal has to count packets over time instead. RX timestamps are a real clock: per-device medians landed
-on the ANT+ channel periods (8086 and 8182 ticks) to two decimals, every gap an integer
-multiple. Zero checksum or length mismatches across 307 frames, which is what confirms
+that wants a proximity or link-quality signal has to count packets over time instead. RX
+timestamps WERE a real clock while they were requested: per-device medians landed on the ANT+
+channel periods (8086 and 8182 ticks) to two decimals, every gap an integer multiple. That is
+what makes not using them a choice rather than a workaround, and the reasoning is above. Zero
+checksum or length mismatches across those 307 frames, which is what confirms
 `serialize_broadcast` writes back every block the flag byte announces.
 
-Two consequences worth knowing:
+One consequence worth knowing, about a dongle that sends a block unasked:
 
 - **The RSSI block is variable width and shifts the timestamp behind it** — dBm (`0x20`) is 3
   bytes, AGC (`0x10`) is 4. `ant-rs` unpacks this correctly; `serialize_broadcast` has to
   write it back the same way, because the flag byte and the header's length are copied from
   the original and a block that is announced but missing leaves the reader parsing the
   checksum as payload.
-- **RX timestamps are NOT what the collision detector times on**, and this file said the
-  opposite until the breakdown below was added. `CollisionDetector` times on the host's
-  arrival clock, deliberately and only: a garbled frame can carry a garbled stamp, so timing
-  collisions by the dongle's own clock means timing them with something the fault itself
-  corrupts (`src/collision.rs`, and `src/init.rs` does not request the block). The cost is
-  real and is the reason the drops are now broken down: arrival gaps DO collapse toward zero
-  when the host batches several USB reads after a stall, which false-collides good messages,
-  and `CollisionStats`'s gap buckets are what tells that apart from a genuinely noisy room.
 
 ## Key Dependencies
 
