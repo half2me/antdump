@@ -24,11 +24,78 @@
 //!
 //! `raceble`'s `src/lib/devices/ant/collision.ts` is the same algorithm for the
 //! browser's WebUSB path; the two are expected to agree packet for packet.
+//!
+//! ## Why the drops are broken down
+//!
+//! One discard total cannot say whether a box is sitting in a noisy room or
+//! whether the HOST is the problem, and those want opposite fixes.
+//! `CollisionStats` answers it two ways, neither of which costs anything to
+//! keep.
+//!
+//! **The gap that convicted the pair.** Overlapping transmissions are garbled
+//! by the radio and handed up together, which is why a venue capture puts real
+//! collisions under a millisecond. A pair several milliseconds apart is one the
+//! air almost certainly delivered cleanly, and what collapsed it is the host: a
+//! read loop that stalls lets the dongle buffer, and the backlog then arrives
+//! back to back on an arrival clock that cannot tell a queue from a collision.
+//! So a count in the upper buckets says go and look at the reader rather than
+//! at the antenna, and one that crowds the threshold says the threshold is too
+//! generous for that venue. The boundaries are ABSOLUTE rather than fractions
+//! of the threshold, because the sub-millisecond claim is a fact about the
+//! radio and does not move when a caller retunes.
+//!
+//! **Pairs against burst continuations.** A collision kills two messages, and
+//! every further arrival inside the sliding window kills one, the quarantined
+//! half being already gone. Splitting them turns the ratio into a shape: a
+//! discard total near twice the event count is isolated pairs, one near the
+//! event count is a device spraying garbage in long runs.
 
 use crate::message::DeviceKey;
 use ant::messages::AntMessage;
 use indexmap::IndexMap;
 use std::time::{Duration, Instant};
+
+/// Under this, the pair is what the radio does to overlapping transmissions.
+const GAP_TIGHT: Duration = Duration::from_millis(1);
+/// Under this, a pair too far apart to be a clean radio collision and too close
+/// to be any sensor's cadence. At or above it, suspect the reader.
+const GAP_LOOSE: Duration = Duration::from_millis(5);
+
+/// What the quarantine threw away, by reason and by how close the pair was.
+///
+/// Counted per collision EVENT, where `dropped_count` counts PACKETS. The two
+/// are deliberately different numbers, tied by `pairs * 2 + bursts == dropped`.
+/// Every field is a total since the detector was built, and `reset` leaves them
+/// alone for the same reason it leaves `dropped` alone: a dongle reopen throws
+/// away quarantine state, not the record of what has been discarded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollisionStats {
+    /// Events that killed a quarantined message and its newcomer.
+    pub pairs: u64,
+    /// Events that killed a newcomer alone, the quarantined half having already
+    /// died to an earlier collision in the same burst.
+    pub bursts: u64,
+    /// Events whose gap was under `GAP_TIGHT`: the radio's own doing.
+    pub gap_under_1ms: u64,
+    /// Events whose gap fell in `GAP_TIGHT..GAP_LOOSE`.
+    pub gap_1_to_5ms: u64,
+    /// Events whose gap was `GAP_LOOSE` or more, up to the threshold.
+    pub gap_over_5ms: u64,
+}
+
+impl CollisionStats {
+    /// Collisions declared, whatever each one cost.
+    #[must_use]
+    pub fn events(&self) -> u64 {
+        self.pairs + self.bursts
+    }
+
+    /// Messages those events threw away. Matches `dropped_count`.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.pairs * 2 + self.bursts
+    }
+}
 
 /// Minimum quarantine hold before release. Generous next to the default
 /// threshold, so a pair split by a host-side read stall still meets in
@@ -56,6 +123,7 @@ pub struct CollisionDetector {
     /// requires.
     device_state: IndexMap<DeviceKey, KeyState>,
     dropped: u64,
+    stats: CollisionStats,
 }
 
 impl CollisionDetector {
@@ -65,6 +133,7 @@ impl CollisionDetector {
             hold: threshold.max(MIN_HOLD),
             device_state: IndexMap::new(),
             dropped: 0,
+            stats: CollisionStats::default(),
         }
     }
 
@@ -74,6 +143,12 @@ impl CollisionDetector {
 
     pub fn dropped_count(&self) -> u64 {
         self.dropped
+    }
+
+    /// The same discards as `dropped_count`, by reason and by gap.
+    #[must_use]
+    pub fn stats(&self) -> CollisionStats {
+        self.stats
     }
 
     /// Returns the previously quarantined same-key message when the newcomer
@@ -95,9 +170,23 @@ impl CollisionDetector {
             return None;
         };
 
-        if now.duration_since(entry.last_wall) < self.threshold {
-            println!("WARNING: Collision on {key}, dropping messages");
-            self.dropped += if entry.pending.is_some() { 2 } else { 1 };
+        let gap = now.duration_since(entry.last_wall);
+        if gap < self.threshold {
+            println!("WARNING: Collision on {key} after {gap:?}, dropping messages");
+            let paired = entry.pending.is_some();
+            self.dropped += if paired { 2 } else { 1 };
+            if paired {
+                self.stats.pairs += 1;
+            } else {
+                self.stats.bursts += 1;
+            }
+            if gap < GAP_TIGHT {
+                self.stats.gap_under_1ms += 1;
+            } else if gap < GAP_LOOSE {
+                self.stats.gap_1_to_5ms += 1;
+            } else {
+                self.stats.gap_over_5ms += 1;
+            }
             entry.pending = None;
             entry.last_wall = now;
             return None;
@@ -148,6 +237,9 @@ mod tests {
     use ant::messages::AntMessage;
 
     const THRESHOLD: Duration = Duration::from_millis(1);
+    /// The receiver firmware's default, and the only one wide enough for every
+    /// gap bucket to be reachable.
+    const WIDE: Duration = Duration::from_millis(25);
 
     fn key_a() -> DeviceKey {
         DeviceKey {
@@ -325,5 +417,81 @@ mod tests {
             .collect();
 
         assert_eq!(released, keys, "released out of first-heard order");
+    }
+
+    /// The stats and the packet counter answer different questions, so the one
+    /// thing that has to hold between them is the arithmetic.
+    #[test]
+    fn a_pair_and_its_burst_are_counted_apart_and_add_up() {
+        let mut det = CollisionDetector::new(WIDE);
+        let t0 = Instant::now();
+
+        det.feed_at(t0, key_a(), plain());
+        // The pair: a quarantined message and a newcomer inside the window.
+        det.feed_at(t0 + Duration::from_micros(200), key_a(), plain());
+        // Two more arrivals while the window slides, each killing itself alone.
+        det.feed_at(t0 + Duration::from_micros(400), key_a(), plain());
+        det.feed_at(t0 + Duration::from_micros(600), key_a(), plain());
+
+        let stats = det.stats();
+        assert_eq!(stats.pairs, 1);
+        assert_eq!(stats.bursts, 2);
+        assert_eq!(stats.events(), 3, "three collisions, four messages");
+        assert_eq!(det.dropped_count(), 4);
+        assert_eq!(stats.dropped(), det.dropped_count());
+    }
+
+    /// The boundaries are what the buckets mean, so they are pinned at the
+    /// edges rather than in the middle of each band.
+    #[test]
+    fn the_gap_buckets_split_the_radio_from_the_reader() {
+        let mut det = CollisionDetector::new(WIDE);
+        let t0 = Instant::now();
+
+        // Each pair is its own key, so every one is a fresh `pairs` event
+        // rather than a burst continuation, and the gap is the one under test.
+        for (i, gap) in [
+            Duration::from_micros(999),
+            Duration::from_millis(1),
+            Duration::from_micros(4999),
+            Duration::from_millis(5),
+            WIDE - Duration::from_micros(1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = DeviceKey {
+                device_number: 2000 + u32::try_from(i).unwrap(),
+                device_type_id: 11,
+            };
+            det.feed_at(t0, key, plain());
+            det.feed_at(t0 + gap, key, plain());
+        }
+
+        let stats = det.stats();
+        assert_eq!(stats.gap_under_1ms, 1, "only the sub-millisecond pair");
+        assert_eq!(stats.gap_1_to_5ms, 2, "1ms is in, 5ms is out");
+        assert_eq!(
+            stats.gap_over_5ms, 2,
+            "5ms and everything up to the threshold"
+        );
+        assert_eq!(stats.pairs, 5);
+        assert_eq!(stats.events(), stats.pairs);
+    }
+
+    /// A dongle reopen throws away quarantine state, not the record of what
+    /// this process has discarded. `dropped_count` already survives it.
+    #[test]
+    fn a_reset_keeps_the_stats_like_it_keeps_the_count() {
+        let mut det = CollisionDetector::new(WIDE);
+        let t0 = Instant::now();
+        det.feed_at(t0, key_a(), plain());
+        det.feed_at(t0 + Duration::from_micros(100), key_a(), plain());
+
+        det.reset();
+
+        assert_eq!(det.stats().pairs, 1);
+        assert_eq!(det.stats().gap_under_1ms, 1);
+        assert_eq!(det.dropped_count(), 2);
     }
 }

@@ -50,7 +50,10 @@ Docker build: `docker build -t antdump .`
 - **`serialize_broadcast`** (`src/message.rs`) — Rebuilds an `AntMessage`'s wire bytes
   (header + payload + every extended block the flag byte announces + checksum)
 - **`CollisionDetector`** (`src/collision.rs`) — Per-device quarantine that drops the
-  garbled pairs some firmware produces when two transmissions overlap on the air
+  garbled pairs some firmware produces when two transmissions overlap on the air.
+  `dropped_count` counts PACKETS and `stats()` counts EVENTS, split into pairs against
+  burst continuations and bucketed by the gap that convicted them, because one total
+  cannot say whether a box is in a noisy room or whether its own reader is stalling
 - **`bring_up`** (`src/usb.rs`) — Finds, opens and configures a dongle, resetting and
   re-finding it between attempts. A selector (`DongleId`: the USB serial or the bus and
   port chain, `20-1.4`) names one stick when several share the bus, and the reset honors
@@ -121,10 +124,14 @@ Two consequences worth knowing:
   write it back the same way, because the flag byte and the header's length are copied from
   the original and a block that is announced but missing leaves the reader parsing the
   checksum as payload.
-- **RX timestamps are not a diagnostic luxury.** `CollisionDetector` times by them when they
-  are present, because wall-clock gaps collapse toward zero whenever the host batches several
-  USB reads after a stall, which false-collides perfectly good messages. Without them it falls
-  back to wall-clock timing, which is what a clone gets.
+- **RX timestamps are NOT what the collision detector times on**, and this file said the
+  opposite until the breakdown below was added. `CollisionDetector` times on the host's
+  arrival clock, deliberately and only: a garbled frame can carry a garbled stamp, so timing
+  collisions by the dongle's own clock means timing them with something the fault itself
+  corrupts (`src/collision.rs`, and `src/init.rs` does not request the block). The cost is
+  real and is the reason the drops are now broken down: arrival gaps DO collapse toward zero
+  when the host batches several USB reads after a stall, which false-collides good messages,
+  and `CollisionStats`'s gap buckets are what tells that apart from a genuinely noisy room.
 
 ## Key Dependencies
 
