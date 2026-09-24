@@ -96,7 +96,18 @@ fn main() -> io::Result<()> {
             Ok(Some(msg)) => match &msg.message {
                 RxMessage::BroadcastData(brd) => match DeviceKey::from_broadcast(brd) {
                     Some(key) if !collision.is_disabled() => {
-                        if let Some(flushed) = collision.feed(key, msg) {
+                        // The warning `--quiet` promises to keep. It lives here
+                        // rather than in the detector because the library never
+                        // prints, and because a write per collision inside the
+                        // read loop is what makes a backlog look like the next
+                        // collision. On stderr, since stdout carries the packet
+                        // stream this may be piped out of.
+                        let before = collision.dropped_count();
+                        let flushed = collision.feed(key, msg);
+                        if collision.dropped_count() != before {
+                            eprintln!("WARNING: collision on {key}, dropping messages");
+                        }
+                        if let Some(flushed) = flushed {
                             handle_broadcast(&key, &flushed, &writer, &mut raw, quiet);
                         }
                     }
