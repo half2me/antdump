@@ -205,7 +205,7 @@ nibble, which is exactly how `DeviceKey::from_broadcast` puts them back together
 never touches. Device number 0 is ANT's wildcard and is refused rather than transmitted.
 
 **The radio sets the pace.** An open master channel transmits on its own period and raises
-`EVENT_TX` when it has done so; `sim::run` answers each one with the next payload. There is
+`EVENT_TX` when it has done so; `sim::pump` answers each one with the next payload. There is
 no timer and no sleeping in the transmit loop — `UsbDriver::get_message` already blocks up
 to 1 ms on its bulk read, so it self-throttles. It also means the displayed packet counts
 are transmissions that actually happened rather than payloads handed over.
@@ -229,10 +229,11 @@ Kill the process and the channel stays open — the stick keeps broadcasting the
 it was handed, at full rate, until something resets it or it is unplugged. Observed
 directly: `antsim` killed, packets still on the air. `ant-rs` has no `Drop` that tears a
 channel down, so nothing does it implicitly. `antsim` therefore catches SIGINT and SIGTERM,
-and each dongle's own thread resets its stick before the process exits; `main` joins those
-threads rather than exiting, because exiting would race the reset. `antsim --reset` is the
-remedy for a stick left transmitting by something that died without doing this, and
-`configure_master`'s opening reset is why simply starting a new run also clears it.
+and `shut_down_all` resets every stick before the process exits — on the way out of a
+normal run, and on the failure path too, where a stick that came up before a later one
+failed would otherwise be left broadcasting. `antsim --reset` is the remedy for a stick
+left transmitting by something that died without doing this, and `configure_master`'s
+opening reset is why simply starting a new run also clears it.
 
 **Untested on hardware.** The simulator was written and unit-tested against a fake driver;
 no ANT+ dongle was available to the environment it was built in, so nothing below the USB
