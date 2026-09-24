@@ -32,7 +32,7 @@ use crate::profile::{
     CSC_CHANNEL_PERIOD, CSC_DEVICE_TYPE, POWER_CHANNEL_PERIOD, POWER_DEVICE_TYPE, RevolutionState,
     Revolutions, csc_page, power_page,
 };
-use crate::usb::{BringUpError, BringUpOps, Dongle, DongleId, open_dongle, reset_dongle};
+use crate::usb::{BringUpError, BringUpOps, Dongle, open_dongle, reset_dongle};
 use ant::drivers::Driver;
 use ant::messages::RxMessage;
 use ant::messages::channel::MessageCode;
@@ -592,10 +592,10 @@ impl BringUpOps for MasterOps<'_> {
     }
 }
 
-/// How many devices the dongles on the bus can carry between them.
+/// How many channels `dongles` sticks carry between them.
 #[must_use]
-pub fn capacity(dongles: &[DongleId]) -> usize {
-    dongles.len() * CHANNELS_PER_DONGLE
+pub fn capacity(dongles: usize) -> usize {
+    dongles * CHANNELS_PER_DONGLE
 }
 
 #[cfg(test)]

@@ -146,7 +146,13 @@ struct Args {
 
 /// One dongle, its share of the fleet, and what it has transmitted so far.
 struct Stick {
-    id: DongleId,
+    /// How the stick describes itself, for messages and the roster. Taken once
+    /// rather than formatted twice a second, and it means nothing here depends
+    /// on the shape of `DongleId`, which is `non_exhaustive` and grows fields.
+    label: String,
+    /// The bus and port chain alone, which is what the table's narrow column
+    /// shows and what names this stick to the driver.
+    port: String,
     driver: Dongle,
     devices: Vec<SimDevice>,
     /// Transmissions per channel.
@@ -156,9 +162,12 @@ struct Stick {
 /// What the display needs from a stick, which is everything except the driver.
 ///
 /// Split out because a `Dongle` cannot be constructed without hardware, and the
-/// layout is worth testing on a machine that has none.
+/// layout is worth testing on a machine that has none. Plain strings rather
+/// than a `DongleId` for the same reason: that type is `non_exhaustive`, so a
+/// test outside the library crate cannot build one.
 struct Panel<'a> {
-    id: &'a DongleId,
+    label: &'a str,
+    port: &'a str,
     devices: &'a [SimDevice],
     sent: &'a [AtomicU64],
 }
@@ -166,7 +175,8 @@ struct Panel<'a> {
 impl Stick {
     fn panel(&self) -> Panel<'_> {
         Panel {
-            id: &self.id,
+            label: &self.label,
+            port: &self.port,
             devices: &self.devices,
             sent: &self.sent,
         }
@@ -191,7 +201,7 @@ fn main() -> io::Result<()> {
     };
     let spans = Spans::of(&args);
     let spec = FleetSpec {
-        devices: fleet_size(args.max, args.devices, &dongles, profiles.len()),
+        devices: fleet_size(args.max, args.devices, dongles.len(), profiles.len()),
         start_id: args.start_id,
         profiles,
         speed_kph: spans.speed,
@@ -263,7 +273,8 @@ fn bring_up_stick(id: &DongleId, devices: Vec<SimDevice>) -> Result<Stick, Strin
 
     match brought_up {
         Ok(driver) => Ok(Stick {
-            id: id.clone(),
+            port: id.port.clone(),
+            label,
             driver,
             sent: (0..devices.len()).map(|_| AtomicU64::new(0)).collect(),
             devices,
@@ -308,7 +319,7 @@ fn transmit(sticks: &mut [Stick], start: Instant, quiet: bool) -> io::Result<Opt
                 if live && drawn > 0 {
                     println!();
                 }
-                return Ok(Some(format!("{}: {err}", stick.id)));
+                return Ok(Some(format!("{}: {err}", stick.label)));
             }
         }
 
@@ -360,7 +371,7 @@ fn shut_down_all(sticks: &mut [Stick]) {
             eprintln!(
                 "WARNING: {}: {err}. It may still be transmitting; \
                  `antsim --reset` or a replug will silence it.",
-                stick.id
+                stick.label
             );
         }
     }
@@ -399,7 +410,7 @@ fn print_dongles() -> io::Result<()> {
     for dongle in &dongles {
         println!("{dongle}");
     }
-    let channels = capacity(&dongles);
+    let channels = capacity(dongles.len());
     println!();
     println!(
         "{} dongle(s) x {CHANNELS_PER_DONGLE} channels = {channels} channels.",
@@ -478,7 +489,7 @@ impl Spans {
 fn fleet_size(
     max: bool,
     devices: Option<usize>,
-    dongles: &[DongleId],
+    dongles: usize,
     channels_per_device: usize,
 ) -> usize {
     let per_dongle = CHANNELS_PER_DONGLE / channels_per_device.max(1);
@@ -510,7 +521,7 @@ fn usable_dongles(selector: Option<&str>) -> io::Result<Vec<DongleId>> {
 fn roster(sticks: &[Panel]) -> String {
     let mut out = String::new();
     for stick in sticks {
-        out.push_str(&format!("{}\n", stick.id));
+        out.push_str(&format!("{}\n", stick.label));
         for (channel, device) in stick.devices.iter().enumerate() {
             out.push_str(&format!(
                 "  ch{channel} {:>11}  {:<13}  {}\n",
@@ -572,7 +583,7 @@ fn frame(sticks: &[Panel], elapsed: Duration) -> String {
             out.push_str(&format!(
                 "  {:<12} {:<8} {channel:>2}  {:<14} {:<18} {:<24} {:>10}\n",
                 key(device),
-                stick.id.port,
+                stick.port,
                 device.profile.to_string(),
                 riding(device),
                 counters(device, elapsed),
@@ -687,7 +698,8 @@ mod tests {
     /// One stick's worth of display data, owned by the test so panels can
     /// borrow it.
     struct Bench {
-        id: DongleId,
+        label: String,
+        port: String,
         devices: Vec<SimDevice>,
         sent: Vec<AtomicU64>,
     }
@@ -695,7 +707,8 @@ mod tests {
     impl Bench {
         fn panel(&self) -> Panel<'_> {
             Panel {
-                id: &self.id,
+                label: &self.label,
+                port: &self.port,
                 devices: &self.devices,
                 sent: &self.sent,
             }
@@ -728,10 +741,8 @@ mod tests {
             .chunks(per_dongle)
             .enumerate()
             .map(|(i, devices)| Bench {
-                id: DongleId {
-                    port: format!("20-1.{}", i + 1),
-                    serial: Some(format!("15508033{i}")),
-                },
+                port: format!("20-1.{}", i + 1),
+                label: format!("20-1.{} 0fcf:1009 serial 15508033{i}", i + 1),
                 devices: devices.to_vec(),
                 sent: (0..devices.len())
                     .map(|ch| AtomicU64::new((1000 + i * per_dongle + ch) as u64))
@@ -809,10 +820,8 @@ mod tests {
         );
 
         let bench = Bench {
-            id: DongleId {
-                port: "1-1.2".to_owned(),
-                serial: Some("134".to_owned()),
-            },
+            port: "1-1.2".to_owned(),
+            label: "1-1.2 0fcf:1009 serial 134".to_owned(),
             sent: (0..4).map(|_| AtomicU64::new(7)).collect(),
             devices: fleet,
         };
@@ -829,31 +838,21 @@ mod tests {
 
     #[test]
     fn max_fills_every_dongle_and_an_explicit_count_still_wins() {
-        let two = [
-            DongleId {
-                port: "1-1.2".to_owned(),
-                serial: Some("134".to_owned()),
-            },
-            DongleId {
-                port: "1-1.3".to_owned(),
-                serial: Some("168".to_owned()),
-            },
-        ];
-        assert_eq!(fleet_size(true, None, &two, 1), 16);
-        assert_eq!(fleet_size(false, Some(3), &two, 1), 3);
+        assert_eq!(fleet_size(true, None, 2, 1), 16);
+        assert_eq!(fleet_size(false, Some(3), 2, 1), 3);
         // No flag and no count is one dongle's worth, whatever is plugged in,
         // so the default leaves the other sticks free to receive on.
-        assert_eq!(fleet_size(false, None, &two, 1), 8);
-        assert_eq!(fleet_size(false, None, &two[..1], 1), 8);
+        assert_eq!(fleet_size(false, None, 2, 1), 8);
+        assert_eq!(fleet_size(false, None, 1, 1), 8);
         // `--max` with a single stick selected fills that stick alone.
-        assert_eq!(fleet_size(true, None, &two[..1], 1), 8);
+        assert_eq!(fleet_size(true, None, 1, 1), 8);
 
         // With the power meter on, a bike costs two channels, so the same
         // hardware carries half as many and --max says so rather than asking
         // for a fleet that cannot fit.
-        assert_eq!(fleet_size(true, None, &two, 2), 8);
-        assert_eq!(fleet_size(true, None, &two[..1], 2), 4);
-        assert_eq!(fleet_size(false, None, &two, 2), 4);
+        assert_eq!(fleet_size(true, None, 2, 2), 8);
+        assert_eq!(fleet_size(true, None, 1, 2), 4);
+        assert_eq!(fleet_size(false, None, 2, 2), 4);
     }
 
     #[test]

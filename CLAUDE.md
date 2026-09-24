@@ -85,7 +85,11 @@ Docker build: `docker build -t antdump .`
   transmissions. The key column is formatted `device_number:device_type_id`, which is
   exactly what `antdump` prints in front of every packet, so the two outputs line up by
   eye and by `grep`. Falls back to a periodic one-line summary when stdout is not a
-  terminal
+  terminal. **A binary under `src/bin` is a separate crate from the library**, so
+  `non_exhaustive` types like `DongleId` cannot be built with a struct literal there —
+  which is why its display takes a `Panel` of plain strings rather than a `DongleId`, and
+  why `capacity` and `fleet_size` take a dongle count. This only breaks on CI, which builds
+  the PR merged with its base, so a local build on an older base will not show it
 - **`SimDevice` / `FleetSpec`** (`src/sim.rs`) — A fleet of virtual bikes and the master
   channels that put them on the air. Mirrors `init.rs` deliberately: same network key,
   same RF frequency, same confirm-every-step discipline, because a transmitter that
