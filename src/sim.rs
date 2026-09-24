@@ -252,9 +252,11 @@ pub enum FleetError {
     WildcardDeviceNumber,
     /// The fleet would run past the 20-bit device number ceiling.
     DeviceNumberOverflow { last: u64 },
-    /// More devices than the sticks on the bus have channels.
+    /// More channels than the sticks on the bus have. Counted in channels
+    /// rather than bikes on purpose: a bike carrying both sensors needs two,
+    /// so the two numbers differ and the channel is what runs out.
     NotEnoughDongles {
-        wanted: usize,
+        channels: usize,
         dongles: usize,
         capacity: usize,
     },
@@ -276,14 +278,16 @@ impl fmt::Display for FleetError {
                 "the fleet would end at device number {last}, past the 20-bit ceiling of {MAX_DEVICE_NUMBER}"
             ),
             Self::NotEnoughDongles {
-                wanted,
+                channels,
                 dongles,
                 capacity,
             } => write!(
                 f,
-                "{wanted} devices need more than the {capacity} channels on {dongles} dongle(s); \
-                 each dongle carries {CHANNELS_PER_DONGLE}, so plug in {} more or ask for fewer devices",
-                wanted
+                "the fleet needs {channels} channel(s) and {dongles} dongle(s) carry \
+                 {capacity}; each dongle has {CHANNELS_PER_DONGLE}, so plug in {} more, ask \
+                 for fewer devices, or drop the power meter with --no-power so each bike \
+                 needs one channel instead of two",
+                channels
                     .div_ceil(CHANNELS_PER_DONGLE)
                     .saturating_sub(*dongles)
             ),
@@ -356,7 +360,7 @@ impl FleetSpec {
         let capacity = dongles * CHANNELS_PER_DONGLE;
         if devices.len() > capacity {
             return Err(FleetError::NotEnoughDongles {
-                wanted: devices.len(),
+                channels: devices.len(),
                 dongles,
                 capacity,
             });
@@ -855,12 +859,41 @@ mod tests {
         assert_eq!(
             FleetSpec::shard(spec(9).build().unwrap(), 1),
             Err(FleetError::NotEnoughDongles {
-                wanted: 9,
+                channels: 9,
                 dongles: 1,
                 capacity: 8,
             })
         );
         assert!(FleetSpec::shard(spec(8).build().unwrap(), 1).is_ok());
+    }
+
+    /// The capacity error counts channels, and a bike with both sensors needs
+    /// two of them, so the number and the noun have to agree: reported as
+    /// bikes it would tell someone who asked for five that ten did not fit.
+    #[test]
+    fn the_capacity_error_counts_channels_rather_than_bikes() {
+        let fleet = FleetSpec {
+            profiles: SPEED_CADENCE_AND_POWER,
+            ..spec(5)
+        }
+        .build()
+        .unwrap();
+        assert_eq!(fleet.len(), 10, "five bikes, two sensors each");
+
+        let err = FleetSpec::shard(fleet, 1).unwrap_err();
+        assert_eq!(
+            err,
+            FleetError::NotEnoughDongles {
+                channels: 10,
+                dongles: 1,
+                capacity: 8,
+            }
+        );
+        let text = err.to_string();
+        assert!(text.contains("10 channel(s)"), "{text}");
+        assert!(!text.contains("10 devices"), "{text}");
+        // And it names the way out that does not need more hardware.
+        assert!(text.contains("--no-power"), "{text}");
     }
 
     /// The split the receiver reverses: low 16 bits in the channel id, top 4 in

@@ -36,11 +36,20 @@ payload — frozen counters at full rate — until it is reset or unplugged. `an
 its channels on Ctrl-C. If something killed it harder than that, `antsim --reset` silences
 the sticks, and so does simply starting another run.
 
-Each dongle carries **8 devices** — that is the radio's limit, not a setting, so a bigger
-fleet needs more sticks. `--max` fills whatever is plugged in rather than making you count;
-combined with `--dongle` it fills that one stick and leaves the others free. Devices are combined speed and cadence sensors (ANT+ device type
-121) transmitting at the profile's 4.05 Hz, numbered upwards from `--start-id`; a start
-above 65535 is legal and exercises the receiver's 20-bit device number path.
+Each bike transmits as a **combined speed and cadence sensor** (device type 121, 4.05 Hz)
+and a **power meter** (device type 11, 4.00 Hz). Both carry the bike's device number and
+differ only by device type, which is how a real bike with a power meter appears — and it is
+what makes `DeviceKey`'s type field earn its keep: keyed on the number alone, a bike's two
+streams would arrive interleaved at ~4 Hz each and false-collide continuously.
+
+Each dongle has **8 channels** — the radio's limit, not a setting. A bike needs one channel
+per sensor, so a stick carries **4 bikes**, or **8 with `--no-power`**, and a bigger fleet
+needs more sticks. `--max` fills whatever is plugged in rather than making you count, and
+divides by whichever profile is in force; with `--dongle` it fills that one stick and leaves
+the others free.
+
+Device numbers count upwards from `--start-id`; a start above 65535 is legal and exercises
+the receiver's 20-bit device number path.
 
 While it runs, `antsim` draws a live table of every device — its key, dongle, channel,
 speed, cadence, revolution counts and packets sent — with fleet totals and the rate the

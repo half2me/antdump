@@ -23,7 +23,7 @@ cargo run -- --server <host:port>                  # Forward data to TCP server
 cargo run -- --server <host:port> --hello_msg <msg> # Send hello before streaming
 
 cargo run --bin antsim -- --list-dongles           # Sticks on the bus and the fleet ceiling
-cargo run --bin antsim                             # 8 simulated bikes on one dongle
+cargo run --bin antsim                             # One dongle's worth: 4 bikes (8 with --no-power)
 cargo run --bin antsim -- --max                    # Fill every dongle found
 cargo run --bin antsim -- --max --no-power         # Twice as many bikes, speed&cadence only
 cargo run --bin antsim -- --max --max-spread       # Fill them and fan across the whole range
