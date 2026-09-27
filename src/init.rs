@@ -26,8 +26,13 @@ use ant::messages::{AntMessage, RxMessage, TransmitableMessage, TxMessageId};
 use std::fmt;
 use std::time::{Duration, Instant};
 
-const NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
-const RF_FREQ: u8 = 57;
+/// The ANT+ public network key. A transmitter has to carry the same key and sit
+/// on the same [`RF_FREQ`] to be heard at all, so both ends of this crate read
+/// these two from here rather than each hard-coding a copy: the simulator that
+/// got either one wrong would be invisible rather than wrong, which is the
+/// expensive way to find out.
+pub const NETWORK_KEY: [u8; 8] = [0xB9, 0xA5, 0x21, 0xFB, 0xBD, 0x72, 0xC3, 0x45];
+pub const RF_FREQ: u8 = 57;
 
 /// How long to wait for an answer. The two dongles on the bench answered in
 /// 1.8 ms and 10.4 ms, so this is generous by two orders of magnitude and only
@@ -127,7 +132,11 @@ pub fn configure<E, D: Driver<E>>(driver: &mut D) -> Result<(), InitError> {
 
 /// Reset the dongle and wait for the startup notification it always answers
 /// with. This is the probe: a dongle that does not answer this one is deaf.
-fn reset<E, D: Driver<E>>(driver: &mut D) -> Result<(), InitError> {
+///
+/// Public because a transmitter needs the same proof before it configures
+/// anything: a master channel written into a deaf stick reports every message
+/// accepted and puts nothing on the air.
+pub fn reset<E, D: Driver<E>>(driver: &mut D) -> Result<(), InitError> {
     send(driver, "a reset", &ResetSystem::new())?;
 
     let deadline = Instant::now() + RESPONSE_TIMEOUT;
@@ -171,7 +180,8 @@ pub fn probe_channel<E, D: Driver<E>>(
     })
 }
 
-fn send<E, D: Driver<E>>(
+/// Write a message, without asking whether the dongle took it.
+pub fn send<E, D: Driver<E>>(
     driver: &mut D,
     message: &'static str,
     msg: &dyn TransmitableMessage,
@@ -182,7 +192,7 @@ fn send<E, D: Driver<E>>(
 }
 
 /// Send a message and require the dongle to accept it.
-fn confirm<E, D: Driver<E>>(
+pub fn confirm<E, D: Driver<E>>(
     driver: &mut D,
     message: &'static str,
     msg: &dyn TransmitableMessage,

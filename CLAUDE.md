@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Antdump is a Rust CLI tool that sniffs ANT+ wireless data from the air using a USB dongle in `OpenRXScanMode`. Captured data is printed as raw hex to the console and can optionally be forwarded to a TCP server. The USB traffic can also be captured by Wireshark for analysis with an ANT+ dissector.
 
+The crate ships a second binary, **`antsim`**, which is the other half of the test loop:
+it transmits a fleet of simulated ANT+ bike sensors so `antdump` can be checked against
+traffic whose every counter is known in advance. Nothing off the shelf does this on Linux
+or macOS — SimulANT+ is Windows-only, and the open-source ANT+ transmitters that do run
+here (antifier, FortiusANT, openant's examples) each simulate exactly one device.
+
 ## Build & Run
 
 ```bash
@@ -15,6 +21,13 @@ cargo test               # Unit + pipeline tests
 cargo run                # Run (auto-detects first ANT+ USB dongle)
 cargo run -- --server <host:port>                  # Forward data to TCP server
 cargo run -- --server <host:port> --hello_msg <msg> # Send hello before streaming
+
+cargo run --bin antsim -- --list-dongles           # Sticks on the bus and the fleet ceiling
+cargo run --bin antsim                             # One dongle's worth: 4 bikes (8 with --no-power)
+cargo run --bin antsim -- --max                    # Fill every dongle found
+cargo run --bin antsim -- --max --no-power         # Twice as many bikes, speed&cadence only
+cargo run --bin antsim -- --max --max-spread       # Fill them and fan across the whole range
+cargo run --bin antsim -- --reset                  # Silence dongles left transmitting
 cargo fmt --check        # What CI checks
 cargo clippy --all-targets --locked -- -D warnings   # What CI GATES on
 ```
@@ -65,6 +78,26 @@ Docker build: `docker build -t antdump .`
   `NoDongle` and an init failure as two different states; `antdump` exits after three.
   The library never prints: each failed attempt goes to the caller's `report` callback,
   so the receiver logs it with a timestamp and `antdump` writes it to stderr
+- **`antsim`** (`src/bin/antsim.rs`) — The simulator's CLI and its live status display:
+  a redrawn table of every device with its key, dongle, channel, speed, cadence, live
+  revolution counts and transmitted-packet count, plus fleet totals and the packet rate
+  the radios *should* be managing, since a measured rate below it is the fleet losing
+  transmissions. The key column is formatted `device_number:device_type_id`, which is
+  exactly what `antdump` prints in front of every packet, so the two outputs line up by
+  eye and by `grep`. Falls back to a periodic one-line summary when stdout is not a
+  terminal. **A binary under `src/bin` is a separate crate from the library**, so
+  `non_exhaustive` types like `DongleId` cannot be built with a struct literal there —
+  which is why its display takes a `Panel` of plain strings rather than a `DongleId`, and
+  why `capacity` and `fleet_size` take a dongle count. This only breaks on CI, which builds
+  the PR merged with its base, so a local build on an older base will not show it
+- **`SimDevice` / `FleetSpec`** (`src/sim.rs`) — A fleet of virtual bikes and the master
+  channels that put them on the air. Mirrors `init.rs` deliberately: same network key,
+  same RF frequency, same confirm-every-step discipline, because a transmitter that
+  disagrees with the receiver on any of those is not wrong, it is silent
+- **`Revolutions`** (`src/profile.rs`) — The counter model, plus the combined speed and
+  cadence page (type 121, period 8086) and the standard power-only page (type 11, period
+  8182). Fitness equipment (type 17, period 8192) is the next one in, and needs only its
+  own page builder here and an arm in `Profile`
 - **`probe_channel`** (`src/init.rs`) — A channel status request for a caller that has heard
   nothing for a while: silence on an open channel is also what an empty room sounds like, so
   this is how a stick that went deaf mid-run is told apart from one with nothing to hear
@@ -137,6 +170,90 @@ One consequence worth knowing, about a dongle that sends a block unasked:
   write it back the same way, because the flag byte and the header's length are copied from
   the original and a block that is announced but missing leaves the reader parsing the
   checksum as payload.
+
+### The simulator: eight per stick, and why one stick cannot test collisions
+
+**Eight CHANNELS per dongle is the radio's number, not a setting.** Both stick types this
+crate has seen (0fcf:1008 and 0fcf:1009) are nRF24AP2-USB parts, which are eight-channel
+ANT network processors. A bike needs one channel per sensor it carries, so the eight buy
+four bikes with speed&cadence and power, or eight with `--no-power`. `antsim --list-dongles`
+prints both ceilings and `--max` fills whichever applies without being told a count. The
+default is deliberately one dongle's worth rather than `--max`: a machine testing this needs
+a stick left over for `antdump` to listen on, so filling everything is opt-in.
+
+**A bike's sensors share its device number and differ only by device type.** That is how a
+real bike with a power meter appears, and it is what makes `DeviceKey`'s type field earn its
+keep: keyed on the number alone, a bike's CSC and power streams would arrive interleaved at
+~4 Hz each and `CollisionDetector` would false-collide them continuously. `FleetSpec::build`
+emits a bike's profiles adjacently so a chunk of eight keeps whole bikes on one stick.
+
+**Power is an accumulator, not a reading, and it advances on crank revolutions.** The page
+carries a running sum of instantaneous watts plus the update event count, and a receiver
+divides the two differences to get average power — so they have to move together or not at
+all. Both are driven off the same `Revolutions` as cadence, which means a rider at 85 rpm
+produces 1.4 events a second against a 4 Hz broadcast: roughly two broadcasts in three
+repeat the previous pair exactly. A receiver that treated each broadcast as a new event
+would compute average power a third too low, which is precisely the bug this catches. The air is nowhere near the constraint — 24
+devices at ~4 Hz is ~97 packets a second and an ANT+ packet is ~150 µs on the air, under
+2% duty cycle — so channel count is the only thing in the way.
+
+**A single stick cannot produce a collision, by design.** The ANT stack time-division
+schedules the channels it owns, so eight masters on one dongle are staggered deliberately
+and never overlap. That makes one stick the right tool for checking that counters parse
+and the wrong tool entirely for exercising `CollisionDetector`: for that the transmissions
+have to come from radios that do not know about each other, which means two dongles
+transmitting and a third receiving.
+
+**The counters repeat on purpose, because real ones do.** ANT+ profiles do not transmit
+speed; they transmit a cumulative revolution count and the time of the revolution that
+bumped it, and the receiver divides. A real sensor's counter only moves when a magnet
+passes, which is not in step with its 4 Hz broadcast, so below ~4 rev/s the same count and
+the same event time go out several broadcasts running. `Revolutions::at` reports the state
+as of the last revolution to have actually happened, so the repeats fall out of the
+arithmetic — a simulator that incremented per broadcast would never produce them, and a
+parser that mishandled them would pass the test. Both counters roll at 16 bits, which puts
+the event time's wrap at exactly 64 seconds: a run of any length crosses it constantly.
+
+**Device numbers are 20 bits and the top four are not in the channel id.** `SimDevice::channel_id`
+puts the low 16 bits in the channel id and the top 4 in the transmission type's extension
+nibble, which is exactly how `DeviceKey::from_broadcast` puts them back together. So
+`--start-id 70000` exercises a branch of the receiver that a fleet numbered below 65536
+never touches. Device number 0 is ANT's wildcard and is refused rather than transmitted.
+
+**The radio sets the pace.** An open master channel transmits on its own period and raises
+`EVENT_TX` when it has done so; `sim::pump` answers each one with the next payload. There is
+no timer and no sleeping in the transmit loop — `UsbDriver::get_message` already blocks up
+to 1 ms on its bulk read, so it self-throttles. It also means the displayed packet counts
+are transmissions that actually happened rather than payloads handed over.
+
+**One thread drives every dongle, and that is not a simplification.** Giving each stick its
+own thread segfaulted on macOS within a second of the channels opening. The Rust side is
+sound — `rusb` marks `DeviceHandle` `Send`, and each thread owned its own driver — but two
+threads doing concurrent synchronous bulk transfers on the shared `GlobalContext` is not a
+path libusb is reliably safe on. `sim::pump` therefore serves at most one message and
+returns, and `antsim` takes turns across its sticks from one thread. The margin is
+comfortable rather than tight: `get_message` blocks at most 1 ms, so a cycle over N sticks
+costs about N ms, while a dongle with all eight channels open raises an `EVENT_TX` roughly
+every 31 ms — and a missed event costs nothing, since the radio repeats the payload and
+raises it again a period later. `sim::run` is the single-dongle loop over `pump`, kept for
+a caller that only has one.
+
+**An open master channel outlives the process that opened it, and this is the surprise
+that matters.** The dongle is an autonomous radio: once `OpenChannel` succeeds its firmware
+transmits at the channel period on its own and only asks the host for the *next* payload.
+Kill the process and the channel stays open — the stick keeps broadcasting the last payload
+it was handed, at full rate, until something resets it or it is unplugged. Observed
+directly: `antsim` killed, packets still on the air. `ant-rs` has no `Drop` that tears a
+channel down, so nothing does it implicitly. `antsim` therefore catches SIGINT and SIGTERM,
+and `shut_down_all` resets every stick before the process exits — on the way out of a
+normal run, and on the failure path too, where a stick that came up before a later one
+failed would otherwise be left broadcasting. `antsim --reset` is the remedy for a stick
+left transmitting by something that died without doing this, and `configure_master`'s
+opening reset is why simply starting a new run also clears it.
+
+**Untested on hardware.** The simulator was written and unit-tested against a fake driver;
+no ANT+ dongle was available to the environment it was built in, so nothing below the USB
+boundary has been exercised on air.
 
 ## Key Dependencies
 
